@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use simmerlib::{
     device::{DeviceContext, WINDOW_NAME},
-    world::{World, BlockType, CHUNK_X, CHUNK_Z, RENDER_DISTANCE, mesh_chunk, ChunkPos},
+    world::{World, BlockType, CHUNK_X, CHUNK_Z, RENDER_DISTANCE, GENERATION_DISTANCE, mesh_chunk, ChunkPos},
     player::{Player, PlayerInput},
     renderer::{Renderer, ViewUBO},
 };
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Generate initial chunks
     print!("  Generating terrain...");
-    world.generate_around(player.position[0], player.position[2]);
+    world.generate_around_immediate(player.position[0], player.position[2]);
     println!(" done ({} chunks)", world.chunks.len());
 
     // Find spawn height
@@ -57,9 +57,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Initial mesh upload
+    // Initial mesh upload (only mesh within render distance, buffer ring stays unmeshed)
     print!("  Meshing chunks...");
-    let chunk_positions: Vec<ChunkPos> = world.chunks.keys().copied().collect();
+    let player_cx = (player.position[0] / CHUNK_X as f32).floor() as i32;
+    let player_cz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
+    let chunk_positions: Vec<ChunkPos> = world.chunks.keys()
+        .filter(|p| (p.x - player_cx).abs() <= RENDER_DISTANCE && (p.z - player_cz).abs() <= RENDER_DISTANCE)
+        .copied().collect();
     for pos in &chunk_positions {
         if let Some(chunk) = world.chunks.get(pos) {
             let neighbors = world.get_neighbors(*pos);
@@ -67,9 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             renderer.upload_chunk_mesh(&device_ctx, *pos, &mesh)?;
         }
     }
-    // Mark all as clean
-    for chunk in world.chunks.values_mut() {
-        chunk.dirty = false;
+    // Mark only meshed chunks as clean (buffer ring stays dirty until it enters view)
+    for pos in &chunk_positions {
+        if let Some(chunk) = world.chunks.get_mut(pos) {
+            chunk.dirty = false;
+        }
     }
     println!(" done");
 
@@ -84,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_fps = 0;
 
     let mut input = PlayerInput::default();
-    let mut meshes_per_frame = 2; // Limit mesh rebuilds per frame
+    let mut meshes_per_frame = 6; // Limit mesh rebuilds per frame
 
     println!("\n═══════════════════════════════════");
     println!("  Controls:");
@@ -95,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  F          - Toggle flying");
     println!("  LClick     - Break block");
     println!("  RClick     - Place block");
+    println!("  T          - Place torch");
     println!("  Scroll     - Change block type");
     println!("  Escape     - Release mouse");
     println!("  Q          - Quit");
@@ -150,6 +157,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Keycode::Space => input.jump = true,
                     Keycode::LShift => input.sneak = true,
                     Keycode::F => input.toggle_fly = true,
+                    Keycode::T => {
+                        // Quick-place torch
+                        if mouse_captured {
+                            let eye = player.eye_position();
+                            let dir = player.forward();
+                            if let Some(hit) = world.raycast(eye, dir, 6.0) {
+                                world.set_block(
+                                    hit.place_pos[0], hit.place_pos[1], hit.place_pos[2],
+                                    BlockType::Torch,
+                                );
+                            }
+                        }
+                    }
                     _ => {}
                 },
 
@@ -219,15 +239,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Generate new chunks around player
         world.generate_around(player.position[0], player.position[2]);
 
-        // Rebuild dirty chunk meshes (limited per frame to avoid stuttering)
+        // Propagate light for dirty chunks before meshing (limited to avoid stalls)
+        let light_dirty: Vec<ChunkPos> = world.chunks.iter()
+            .filter(|(_, c)| c.light_dirty)
+            .map(|(p, _)| *p)
+            .take(6)
+            .collect();
+        for pos in light_dirty {
+            if let Some(chunk) = world.chunks.get_mut(&pos) {
+                chunk.propagate_light();
+            }
+        }
+
+        // Only mesh dirty chunks within RENDER_DISTANCE that have all neighbors
+        // (buffer ring chunks stay unmeshed — they exist only so visible chunks
+        // have correct AO data at their boundaries)
+        let pcx = (player.position[0] / CHUNK_X as f32).floor() as i32;
+        let pcz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
+
         let mut rebuilt = 0;
-        let dirty_chunks: Vec<ChunkPos> = world.chunks.iter()
-            .filter(|(_, c)| c.dirty)
+        let mut dirty_chunks: Vec<ChunkPos> = world.chunks.iter()
+            .filter(|(p, c)| c.dirty
+                && (p.x - pcx).abs() <= RENDER_DISTANCE
+                && (p.z - pcz).abs() <= RENDER_DISTANCE)
             .map(|(p, _)| *p)
             .collect();
+        dirty_chunks.sort_by_key(|p| {
+            let dx = p.x - pcx;
+            let dz = p.z - pcz;
+            dx * dx + dz * dz
+        });
 
         for pos in dirty_chunks {
             if rebuilt >= meshes_per_frame { break; }
+            // Only mesh if all 8 neighbors exist — prevents AO seams
+            if !world.has_all_neighbors(pos) { continue; }
             if let Some(chunk) = world.chunks.get(&pos) {
                 let neighbors = world.get_neighbors(pos);
                 let mesh = mesh_chunk(chunk, &neighbors);
@@ -239,8 +285,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rebuilt += 1;
         }
 
-        // Remove GPU data for unloaded chunks
-        // (handled naturally - chunks removed from world won't get new uploads)
+        // Remove GPU data for chunks that left render distance
+        let gpu_chunks: Vec<ChunkPos> = renderer.loaded_chunk_positions();
+        for pos in gpu_chunks {
+            if (pos.x - pcx).abs() > RENDER_DISTANCE + 1
+            || (pos.z - pcz).abs() > RENDER_DISTANCE + 1 {
+                renderer.remove_chunk(pos);
+            }
+        }
 
         // Render
         let aspect = device_ctx.swapchain_extent.width as f32 / device_ctx.swapchain_extent.height as f32;

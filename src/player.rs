@@ -237,14 +237,16 @@ impl Player {
             BlockType::Wood => BlockType::Leaves,
             BlockType::Leaves => BlockType::Gravel,
             BlockType::Gravel => BlockType::Snow,
-            BlockType::Snow => BlockType::Stone,
+            BlockType::Snow => BlockType::Torch,
+            BlockType::Torch => BlockType::Stone,
             _ => BlockType::Stone,
         };
     }
 
     pub fn prev_block(&mut self) {
         self.selected_block = match self.selected_block {
-            BlockType::Stone => BlockType::Snow,
+            BlockType::Stone => BlockType::Torch,
+            BlockType::Torch => BlockType::Snow,
             BlockType::Snow => BlockType::Gravel,
             BlockType::Gravel => BlockType::Leaves,
             BlockType::Leaves => BlockType::Wood,

@@ -72,9 +72,7 @@ pub struct Renderer {
     // Cached
     memory_properties: vk::PhysicalDeviceMemoryProperties,
 
-    // Deferred deletion: (frame_number_when_queued, buffer, memory)
-    // Only destroyed after MAX_FRAMES renders have completed since queuing,
-    // guaranteeing no in-flight command buffer still references them.
+    // Deferred deletion
     deletion_queue: Vec<(u64, vk::Buffer, vk::DeviceMemory)>,
     frame_counter: u64,
 }
@@ -155,7 +153,6 @@ impl Renderer {
         let vert_size = (std::mem::size_of::<BlockVertex>() * mesh.vertices.len()) as u64;
         let idx_size = (std::mem::size_of::<u32>() * mesh.indices.len()) as u64;
 
-        // Create vertex buffer (host visible for simplicity - staging would be better for perf)
         let (vb, vm) = Self::create_buffer_with_data(
             &self.device, device_ctx,
             &mesh.vertices,
@@ -183,19 +180,13 @@ impl Renderer {
 
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
         if let Some(data) = self.chunk_data.remove(&pos) {
-            // Tag with current frame counter - will be destroyed after MAX_FRAMES more renders
             let frame = self.frame_counter;
             self.deletion_queue.push((frame, data.vertex_buffer, data.vertex_memory));
             self.deletion_queue.push((frame, data.index_buffer, data.index_memory));
         }
     }
 
-    /// Destroy buffers that have been deferred long enough for all in-flight
-    /// frames to have completed. Called at the start of each render().
     fn flush_deletion_queue(&mut self) {
-        // A buffer queued at frame N was potentially used by frames N-1 and N
-        // (the two in-flight slots). After MAX_FRAMES more renders complete,
-        // both of those submissions are guaranteed finished.
         let safe_frame = self.frame_counter.saturating_sub(MAX_FRAMES as u64);
         self.deletion_queue.retain(|&(queued_frame, buffer, memory)| {
             if queued_frame <= safe_frame {
@@ -203,9 +194,9 @@ impl Renderer {
                     self.device.destroy_buffer(buffer, None);
                     self.device.free_memory(memory, None);
                 }
-                false // remove from queue
+                false
             } else {
-                true // keep waiting
+                true
             }
         });
     }
@@ -219,7 +210,6 @@ impl Renderer {
             self.device.wait_for_fences(
                 &[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
 
-            // Flush buffers that have been deferred long enough
             self.flush_deletion_queue();
 
             let (image_index, _) = match device_ctx.swapchain_loader.acquire_next_image(
@@ -459,13 +449,18 @@ impl Renderer {
                 .binding(0).stride(std::mem::size_of::<BlockVertex>() as u32)
                 .input_rate(vk::VertexInputRate::VERTEX);
 
+            // 5 attributes: position, color, normal, ao, light
             let attrs = [
                 vk::VertexInputAttributeDescription::default().binding(0).location(0)
-                    .format(vk::Format::R32G32B32_SFLOAT).offset(0),
+                    .format(vk::Format::R32G32B32_SFLOAT).offset(0),   // position
                 vk::VertexInputAttributeDescription::default().binding(0).location(1)
-                    .format(vk::Format::R32G32B32_SFLOAT).offset(12),
+                    .format(vk::Format::R32G32B32_SFLOAT).offset(12),  // color
                 vk::VertexInputAttributeDescription::default().binding(0).location(2)
-                    .format(vk::Format::R32G32B32_SFLOAT).offset(24),
+                    .format(vk::Format::R32G32B32_SFLOAT).offset(24),  // normal
+                vk::VertexInputAttributeDescription::default().binding(0).location(3)
+                    .format(vk::Format::R32_SFLOAT).offset(36),        // ao
+                vk::VertexInputAttributeDescription::default().binding(0).location(4)
+                    .format(vk::Format::R32_SFLOAT).offset(40),        // light
             ];
 
             let vi = vk::PipelineVertexInputStateCreateInfo::default()
@@ -583,15 +578,12 @@ impl Renderer {
     fn create_crosshair_buffer(
         device: &Device, device_ctx: &DeviceContext,
     ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
-        // Cross (+) shape: 2 quads = 12 vertices (triangle list)
-        let s = 0.018f32; // arm length
-        let t = 0.003f32; // arm thickness
+        let s = 0.018f32;
+        let t = 0.003f32;
         #[rustfmt::skip]
         let verts: [f32; 24] = [
-            // Horizontal bar (2 triangles)
             -s, -t,   s, -t,   s,  t,
             -s, -t,   s,  t,  -s,  t,
-            // Vertical bar (2 triangles)
             -t, -s,   t, -s,   t,  s,
             -t, -s,   t,  s,  -t,  s,
         ];
@@ -670,6 +662,10 @@ impl Renderer {
     pub fn chunk_count(&self) -> usize {
         self.chunk_data.len()
     }
+
+    pub fn loaded_chunk_positions(&self) -> Vec<ChunkPos> {
+        self.chunk_data.keys().copied().collect()
+    }
 }
 
 fn find_mem_type(props: vk::PhysicalDeviceMemoryProperties, filter: u32, flags: vk::MemoryPropertyFlags) -> Result<u32, Box<dyn std::error::Error>> {
@@ -690,13 +686,11 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
-            // Flush all deferred deletions
             for &(_, buffer, memory) in &self.deletion_queue {
                 self.device.destroy_buffer(buffer, None);
                 self.device.free_memory(memory, None);
             }
 
-            // Chunk data
             for data in self.chunk_data.values() {
                 self.device.destroy_buffer(data.vertex_buffer, None);
                 self.device.free_memory(data.vertex_memory, None);
@@ -704,19 +698,15 @@ impl Drop for Renderer {
                 self.device.free_memory(data.index_memory, None);
             }
 
-            // Sync
             for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }
             for &s in &self.render_finished { self.device.destroy_semaphore(s, None); }
             for &s in &self.image_available { self.device.destroy_semaphore(s, None); }
 
-            // Descriptors
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
-            // Framebuffers
             for &fb in &self.framebuffers { self.device.destroy_framebuffer(fb, None); }
 
-            // Pipelines
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_pipeline(self.crosshair_pipeline, None);
@@ -724,12 +714,10 @@ impl Drop for Renderer {
 
             self.device.destroy_render_pass(self.render_pass, None);
 
-            // Uniform
             self.device.unmap_memory(self.uniform_memory);
             self.device.destroy_buffer(self.uniform_buffer, None);
             self.device.free_memory(self.uniform_memory, None);
 
-            // Crosshair
             self.device.destroy_buffer(self.crosshair_vertex_buffer, None);
             self.device.free_memory(self.crosshair_vertex_memory, None);
         }
