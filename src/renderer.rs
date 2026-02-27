@@ -72,9 +72,11 @@ pub struct Renderer {
     // Cached
     memory_properties: vk::PhysicalDeviceMemoryProperties,
 
-    // Deferred deletion queue: buffers waiting for GPU to finish using them
-    // Index by frame slot - flushed after that frame's fence is signaled
-    deletion_queue: [Vec<(vk::Buffer, vk::DeviceMemory)>; MAX_FRAMES],
+    // Deferred deletion: (frame_number_when_queued, buffer, memory)
+    // Only destroyed after MAX_FRAMES renders have completed since queuing,
+    // guaranteeing no in-flight command buffer still references them.
+    deletion_queue: Vec<(u64, vk::Buffer, vk::DeviceMemory)>,
+    frame_counter: u64,
 }
 
 const MAX_FRAMES: usize = 2;
@@ -132,7 +134,8 @@ impl Renderer {
             crosshair_pipeline, crosshair_pipeline_layout,
             crosshair_vertex_buffer, crosshair_vertex_memory,
             memory_properties: device_ctx.memory_properties,
-            deletion_queue: [Vec::new(), Vec::new()],
+            deletion_queue: Vec::new(),
+            frame_counter: 0,
         })
     }
 
@@ -180,23 +183,31 @@ impl Renderer {
 
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
         if let Some(data) = self.chunk_data.remove(&pos) {
-            // Defer destruction until the current frame's fence is waited on,
-            // guaranteeing the GPU is no longer using these buffers
-            let slot = self.current_frame;
-            self.deletion_queue[slot].push((data.vertex_buffer, data.vertex_memory));
-            self.deletion_queue[slot].push((data.index_buffer, data.index_memory));
+            // Tag with current frame counter - will be destroyed after MAX_FRAMES more renders
+            let frame = self.frame_counter;
+            self.deletion_queue.push((frame, data.vertex_buffer, data.vertex_memory));
+            self.deletion_queue.push((frame, data.index_buffer, data.index_memory));
         }
     }
 
-    /// Destroy all buffers queued for deletion on this frame slot.
-    /// Must be called AFTER waiting on the frame's fence.
-    fn flush_deletion_queue(&mut self, slot: usize) {
-        for (buffer, memory) in self.deletion_queue[slot].drain(..) {
-            unsafe {
-                self.device.destroy_buffer(buffer, None);
-                self.device.free_memory(memory, None);
+    /// Destroy buffers that have been deferred long enough for all in-flight
+    /// frames to have completed. Called at the start of each render().
+    fn flush_deletion_queue(&mut self) {
+        // A buffer queued at frame N was potentially used by frames N-1 and N
+        // (the two in-flight slots). After MAX_FRAMES more renders complete,
+        // both of those submissions are guaranteed finished.
+        let safe_frame = self.frame_counter.saturating_sub(MAX_FRAMES as u64);
+        self.deletion_queue.retain(|&(queued_frame, buffer, memory)| {
+            if queued_frame <= safe_frame {
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                false // remove from queue
+            } else {
+                true // keep waiting
             }
-        }
+        });
     }
 
     pub fn render(
@@ -208,8 +219,8 @@ impl Renderer {
             self.device.wait_for_fences(
                 &[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
 
-            // Safe to destroy buffers that were queued when this frame slot last rendered
-            self.flush_deletion_queue(self.current_frame);
+            // Flush buffers that have been deferred long enough
+            self.flush_deletion_queue();
 
             let (image_index, _) = match device_ctx.swapchain_loader.acquire_next_image(
                 device_ctx.swapchain, u64::MAX,
@@ -335,6 +346,7 @@ impl Renderer {
             }
 
             self.current_frame = (self.current_frame + 1) % MAX_FRAMES;
+            self.frame_counter += 1;
         }
         Ok(())
     }
@@ -678,12 +690,10 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
-            // Flush deferred deletions
-            for slot in 0..MAX_FRAMES {
-                for (buffer, memory) in self.deletion_queue[slot].drain(..) {
-                    self.device.destroy_buffer(buffer, None);
-                    self.device.free_memory(memory, None);
-                }
+            // Flush all deferred deletions
+            for &(_, buffer, memory) in &self.deletion_queue {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
             }
 
             // Chunk data

@@ -191,6 +191,11 @@ impl DeviceContext {
             let _ = self.device.device_wait_idle();
             self.swapchain_image_views.iter().for_each(|&v| self.device.destroy_image_view(v, None));
             
+            // Destroy old depth buffer
+            self.device.destroy_image_view(self.depth_image_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_image_memory, None);
+            
             let caps = self.surface_loader.get_physical_device_surface_capabilities(self.physical_device, self.surface).unwrap();
             let extent = vk::Extent2D {
                 width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
@@ -218,6 +223,36 @@ impl DeviceContext {
                         level_count: 1, base_array_layer: 0, layer_count: 1,
                     }).image(img), None).unwrap()).collect();
             self.swapchain_extent = extent;
+            
+            // Recreate depth buffer at new size
+            self.depth_image = self.device.create_image(&vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+                .mip_levels(1).array_layers(1).samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE), None).unwrap();
+            
+            let mem_req = self.device.get_image_memory_requirements(self.depth_image);
+            let memory_type_index = (0..self.memory_properties.memory_type_count)
+                .find(|&i| {
+                    (mem_req.memory_type_bits & (1 << i)) != 0 &&
+                    self.memory_properties.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                }).expect("No suitable memory for depth buffer");
+            
+            self.depth_image_memory = self.device.allocate_memory(&vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_req.size)
+                .memory_type_index(memory_type_index), None).unwrap();
+            
+            self.device.bind_image_memory(self.depth_image, self.depth_image_memory, 0).unwrap();
+            
+            self.depth_image_view = self.device.create_image_view(&vk::ImageViewCreateInfo::default()
+                .view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::D32_SFLOAT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH, base_mip_level: 0,
+                    level_count: 1, base_array_layer: 0, layer_count: 1,
+                }).image(self.depth_image), None).unwrap();
         }
     }
 }

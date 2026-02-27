@@ -115,10 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let pos = player.position;
             let mode = if player.flying { "FLY" } else { "WALK" };
+            let looking_at = world.raycast(player.eye_position(), player.forward(), 6.0)
+                .map(|hit| format!("{:?}", hit.block_type))
+                .unwrap_or_else(|| "---".to_string());
             window.set_title(&format!(
-                "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | Chunks: {} | Block: {:?}",
+                "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | Chunks: {} | Looking: {} | Place: {:?}",
                 last_fps, pos[0], pos[1], pos[2], mode,
-                renderer.chunk_count(), player.selected_block,
+                renderer.chunk_count(), looking_at, player.selected_block,
             )).ok();
         }
 

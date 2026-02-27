@@ -71,7 +71,7 @@ impl Player {
 
     fn right(&self) -> [f32; 3] {
         let f = self.flat_forward();
-        [f[2], 0.0, -f[0]]
+        [-f[2], 0.0, f[0]]
     }
 
     pub fn look(&mut self, dx: f32, dy: f32) {
