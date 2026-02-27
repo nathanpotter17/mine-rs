@@ -1,0 +1,3 @@
+shaders/compiled/
+Cargo.lock
+target/
