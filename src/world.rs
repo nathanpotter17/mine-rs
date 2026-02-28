@@ -193,11 +193,32 @@ impl Chunk {
 }
 
 // ===== Mesh Vertex =====
+// Compact 20-byte vertex (down from 44 bytes = 2.2× less bandwidth)
+//   position:     [f32; 3]  = 12 bytes
+//   color_ao:     u32       = 4 bytes  (R8G8B8 color + A8 AO, UNORM → auto 0.0-1.0)
+//   normal_light: u32       = 4 bytes  (R8=normal_idx, G8=light_u8, B8A8=reserved)
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BlockVertex {
-    pub position: [f32; 3], pub color: [f32; 3], pub normal: [f32; 3], pub ao: f32, pub light: f32,
+    pub position: [f32; 3],
+    pub color_ao: u32,
+    pub normal_light: u32,
+}
+
+impl BlockVertex {
+    /// Pack color [f32;3], AO f32 (0/3..3/3), normal index u8 (0-5), light f32 (0.0-1.0)
+    #[inline]
+    pub fn new(position: [f32; 3], color: [f32; 3], normal_idx: u8, ao: f32, light: f32) -> Self {
+        let r = (color[0] * 255.0 + 0.5) as u8;
+        let g = (color[1] * 255.0 + 0.5) as u8;
+        let b = (color[2] * 255.0 + 0.5) as u8;
+        let a = (ao.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let color_ao = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24);
+        let light_u8 = (light.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let normal_light = (normal_idx as u32) | ((light_u8 as u32) << 8);
+        Self { position, color_ao, normal_light }
+    }
 }
 
 pub struct ChunkMesh {
@@ -308,28 +329,31 @@ fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32,
     let color = [0.95,0.82,0.35]; let cx = x+0.5; let cz = z+0.5;
     let r = 0.1; let h = 0.65;
 
+    // North face (normal_idx=2)
     let base = verts.len() as u32;
-    verts.push(BlockVertex { position: [cx-r,y,cz],   color, normal: [0.0,0.0,1.0], ao: 1.0, light: light_val });
-    verts.push(BlockVertex { position: [cx+r,y,cz],   color, normal: [0.0,0.0,1.0], ao: 1.0, light: light_val });
-    verts.push(BlockVertex { position: [cx+r,y+h,cz], color, normal: [0.0,0.0,1.0], ao: 1.0, light: light_val });
-    verts.push(BlockVertex { position: [cx-r,y+h,cz], color, normal: [0.0,0.0,1.0], ao: 1.0, light: light_val });
+    verts.push(BlockVertex::new([cx-r,y,cz],   color, 2, 1.0, light_val));
+    verts.push(BlockVertex::new([cx+r,y,cz],   color, 2, 1.0, light_val));
+    verts.push(BlockVertex::new([cx+r,y+h,cz], color, 2, 1.0, light_val));
+    verts.push(BlockVertex::new([cx-r,y+h,cz], color, 2, 1.0, light_val));
     idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
     idxs.extend_from_slice(&[base+2,base+1,base, base,base+3,base+2]);
 
+    // East face (normal_idx=4)
     let base = verts.len() as u32;
-    verts.push(BlockVertex { position: [cx,y,cz-r],   color, normal: [1.0,0.0,0.0], ao: 1.0, light: light_val });
-    verts.push(BlockVertex { position: [cx,y,cz+r],   color, normal: [1.0,0.0,0.0], ao: 1.0, light: light_val });
-    verts.push(BlockVertex { position: [cx,y+h,cz+r], color, normal: [1.0,0.0,0.0], ao: 1.0, light: light_val });
-    verts.push(BlockVertex { position: [cx,y+h,cz-r], color, normal: [1.0,0.0,0.0], ao: 1.0, light: light_val });
+    verts.push(BlockVertex::new([cx,y,cz-r],   color, 4, 1.0, light_val));
+    verts.push(BlockVertex::new([cx,y,cz+r],   color, 4, 1.0, light_val));
+    verts.push(BlockVertex::new([cx,y+h,cz+r], color, 4, 1.0, light_val));
+    verts.push(BlockVertex::new([cx,y+h,cz-r], color, 4, 1.0, light_val));
     idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
     idxs.extend_from_slice(&[base+2,base+1,base, base,base+3,base+2]);
 
+    // Top face (normal_idx=0) — flame
     let flame = [1.0,0.65,0.15];
     let base = verts.len() as u32;
-    verts.push(BlockVertex { position: [cx-r,y+h,cz-r], color: flame, normal: [0.0,1.0,0.0], ao: 1.0, light: 1.0 });
-    verts.push(BlockVertex { position: [cx+r,y+h,cz-r], color: flame, normal: [0.0,1.0,0.0], ao: 1.0, light: 1.0 });
-    verts.push(BlockVertex { position: [cx+r,y+h,cz+r], color: flame, normal: [0.0,1.0,0.0], ao: 1.0, light: 1.0 });
-    verts.push(BlockVertex { position: [cx-r,y+h,cz+r], color: flame, normal: [0.0,1.0,0.0], ao: 1.0, light: 1.0 });
+    verts.push(BlockVertex::new([cx-r,y+h,cz-r], flame, 0, 1.0, 1.0));
+    verts.push(BlockVertex::new([cx+r,y+h,cz-r], flame, 0, 1.0, 1.0));
+    verts.push(BlockVertex::new([cx+r,y+h,cz+r], flame, 0, 1.0, 1.0));
+    verts.push(BlockVertex::new([cx-r,y+h,cz+r], flame, 0, 1.0, 1.0));
     idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
 }
 
@@ -339,7 +363,7 @@ fn add_face_ao(
     ao: [f32;4], light: [f32;4], ao_raw: [u8;4],
 ) {
     let base = verts.len() as u32;
-    let n = face.normal();
+    let ni = face as u8;
     let (v0,v1,v2,v3) = match face {
         Face::Top    => ([x,y+1.0,z],[x+1.0,y+1.0,z],[x+1.0,y+1.0,z+1.0],[x,y+1.0,z+1.0]),
         Face::Bottom => ([x,y,z+1.0],[x+1.0,y,z+1.0],[x+1.0,y,z],[x,y,z]),
@@ -348,10 +372,10 @@ fn add_face_ao(
         Face::East   => ([x+1.0,y,z],[x+1.0,y,z+1.0],[x+1.0,y+1.0,z+1.0],[x+1.0,y+1.0,z]),
         Face::West   => ([x,y,z+1.0],[x,y,z],[x,y+1.0,z],[x,y+1.0,z+1.0]),
     };
-    verts.push(BlockVertex { position: v0, color, normal: n, ao: ao[0], light: light[0] });
-    verts.push(BlockVertex { position: v1, color, normal: n, ao: ao[1], light: light[1] });
-    verts.push(BlockVertex { position: v2, color, normal: n, ao: ao[2], light: light[2] });
-    verts.push(BlockVertex { position: v3, color, normal: n, ao: ao[3], light: light[3] });
+    verts.push(BlockVertex::new(v0, color, ni, ao[0], light[0]));
+    verts.push(BlockVertex::new(v1, color, ni, ao[1], light[1]));
+    verts.push(BlockVertex::new(v2, color, ni, ao[2], light[2]));
+    verts.push(BlockVertex::new(v3, color, ni, ao[3], light[3]));
     if ao_raw[0] + ao_raw[2] > ao_raw[1] + ao_raw[3] {
         idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
     } else {
@@ -752,6 +776,8 @@ pub struct World {
     heightmap: Arc<HeightmapCache>,
     gen_pool: ChunkGenPool,
     pub mesh_pool: MeshPool,
+    cleanup_counter: u32,
+    hm_prefetch_idx: i32,
 }
 
 impl World {
@@ -763,6 +789,8 @@ impl World {
             heightmap: hm.clone(),
             gen_pool: ChunkGenPool::new(GEN_WORKERS, seed, hm),
             mesh_pool: MeshPool::new(MESH_WORKERS),
+            cleanup_counter: 0,
+            hm_prefetch_idx: 0,
         }
     }
 
@@ -789,12 +817,14 @@ impl World {
     }
 
     /// Per-frame async generation + mesh dispatch.
-    /// Main thread cost: ~0.1ms (channel drains + snapshot memcpys).
+    /// Budget target: <2ms on main thread.
     pub fn generate_around(&mut self, px: f32, pz: f32) {
         let cx = (px / CHUNK_X as f32).floor() as i32;
         let cz = (pz / CHUNK_Z as f32).floor() as i32;
 
-        // Drain completed generations
+        let ta = std::time::Instant::now();
+
+        // Drain completed generations (cheap: just channel recv + hashmap insert)
         for chunk in self.gen_pool.drain() {
             let pos = chunk.pos;
             self.chunks.insert(pos, chunk);
@@ -803,7 +833,9 @@ impl World {
             }
         }
 
-        // Submit generation requests (spiral)
+        let tb = std::time::Instant::now();
+
+        // Submit generation requests (spiral) — cap at MAX_CHUNKS_PER_FRAME * 2
         let mut req = 0;
         'outer: for dist in 0..=GENERATION_DISTANCE { for dz in -dist..=dist { for dx in -dist..=dist {
             if dx.abs() != dist && dz.abs() != dist { continue; }
@@ -815,24 +847,71 @@ impl World {
             }
         }}}
 
-        // Propagate light for dirty chunks (still needed for set_block edits)
+        let tc = std::time::Instant::now();
+
+        // Propagate light — only 2 chunks/frame max (each can be expensive)
+        let mut light_count = 0;
         let light_dirty: Vec<ChunkPos> = self.chunks.iter()
-            .filter(|(_,c)| c.light_dirty).map(|(p,_)| *p).take(6).collect();
+            .filter(|(_,c)| c.light_dirty).map(|(p,_)| *p).take(2).collect();
         for pos in light_dirty {
-            if let Some(chunk) = self.chunks.get_mut(&pos) { chunk.propagate_light(); }
+            if let Some(chunk) = self.chunks.get_mut(&pos) {
+                chunk.propagate_light();
+                light_count += 1;
+            }
         }
 
-        // Submit mesh jobs for dirty visible chunks
+        let td = std::time::Instant::now();
+
+        // Submit mesh jobs — cap at 4 snapshots/frame (each = 9 × 65KB clone)
         self.submit_mesh_jobs(cx, cz);
 
-        // Prefetch heightmaps
-        for dist in (GENERATION_DISTANCE+1)..=HM_PREFETCH { for dz in -dist..=dist { for dx in -dist..=dist {
-            if dx.abs() != dist && dz.abs() != dist { continue; }
-            self.heightmap.precompute_chunk(ChunkPos::new(cx+dx,cz+dz), &self.noise, &self.tree_noise);
-        }}}
+        let te = std::time::Instant::now();
 
-        self.remove_far_chunks(cx, cz);
-        self.heightmap.evict_far(cx, cz, HM_PREFETCH + 2);
+        // Heightmap prefetch: only 1 chunk per frame to avoid mutex storm
+        self.hm_prefetch_step(cx, cz);
+
+        let tf = std::time::Instant::now();
+
+        // Cleanup: only every 30 frames to amortize retain() cost
+        self.cleanup_counter += 1;
+        if self.cleanup_counter >= 30 {
+            self.cleanup_counter = 0;
+            self.remove_far_chunks(cx, cz);
+            self.heightmap.evict_far(cx, cz, HM_PREFETCH + 2);
+        }
+
+        let tg = std::time::Instant::now();
+
+        // Print sub-timings (remove after profiling)
+        let drain = (tb-ta).as_secs_f64()*1000.0;
+        let genreq = (tc-tb).as_secs_f64()*1000.0;
+        let light = (td-tc).as_secs_f64()*1000.0;
+        let mesh = (te-td).as_secs_f64()*1000.0;
+        let hmpre = (tf-te).as_secs_f64()*1000.0;
+        let clean = (tg-tf).as_secs_f64()*1000.0;
+        let total = (tg-ta).as_secs_f64()*1000.0;
+        if total > 2.0 {
+            println!("    [world] drain={:.1} genreq={:.1} light={:.1} mesh={:.1} hmpre={:.1} clean={:.1} TOTAL={:.1}ms (lit={})",
+                drain, genreq, light, mesh, hmpre, clean, total, light_count);
+        }
+    }
+
+    /// Incremental heightmap prefetch: 1 chunk per frame around the prefetch ring.
+    fn hm_prefetch_step(&mut self, cx: i32, cz: i32) {
+        // Walk one step of the ring each frame
+        let ring_size = HM_PREFETCH * 2 + 1;
+        let total = ring_size * ring_size;
+        for _ in 0..1 {
+            let idx = self.hm_prefetch_idx % total;
+            self.hm_prefetch_idx += 1;
+            let dx = (idx % ring_size) - HM_PREFETCH;
+            let dz = (idx / ring_size) - HM_PREFETCH;
+            // Only prefetch the outer ring (beyond GENERATION_DISTANCE)
+            if dx.abs() > GENERATION_DISTANCE || dz.abs() > GENERATION_DISTANCE {
+                self.heightmap.precompute_chunk(
+                    ChunkPos::new(cx + dx, cz + dz), &self.noise, &self.tree_noise);
+            }
+        }
     }
 
     fn submit_mesh_jobs(&mut self, pcx: i32, pcz: i32) {
@@ -844,7 +923,7 @@ impl World {
         dirty.sort_unstable_by_key(|p| { let (dx,dz) = (p.x-pcx, p.z-pcz); dx*dx + dz*dz });
         let mut submitted = 0;
         for pos in dirty {
-            if submitted >= 8 { break; }
+            if submitted >= 4 { break; }
             if !self.has_all_neighbors(pos) { continue; }
             self.mesh_pool.submit(pos, &self.chunks);
             if let Some(c) = self.chunks.get_mut(&pos) { c.dirty = false; }

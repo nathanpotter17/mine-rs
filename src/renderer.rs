@@ -23,12 +23,99 @@ pub struct ViewUBO {
     pub camera_pos: [f32; 4], // w unused
 }
 
+// ===== Frustum Culling =====
+
+/// 6 planes in [a,b,c,d] form (ax+by+cz+d >= 0 means inside).
+/// Extracted from the combined view-projection matrix each frame.
+pub struct Frustum {
+    planes: [[f32; 4]; 6],
+}
+
+impl Frustum {
+    /// Extract 6 frustum planes from view and projection matrices.
+    ///
+    /// Our matrices are stored **column-major**: `m[col][row]`.
+    /// look_at stores basis vectors as columns, perspective likewise.
+    /// Gribb-Hartmann expects row indexing on the combined clip matrix,
+    /// so we index as m[col][row] and extract accordingly.
+    pub fn from_view_proj(v: &[[f32; 4]; 4], p: &[[f32; 4]; 4]) -> Self {
+        // Compute clip = P * V in column-major layout.
+        // m[col][row] = sum_k p[k][row] * v[col][k]
+        let mut m = [[0.0f32; 4]; 4];
+        for col in 0..4 {
+            for row in 0..4 {
+                m[col][row] = p[0][row]*v[col][0] + p[1][row]*v[col][1]
+                            + p[2][row]*v[col][2] + p[3][row]*v[col][3];
+            }
+        }
+
+        // Gribb-Hartmann: extract planes from the clip matrix.
+        // For column-major m[col][row], "row i" is accessed as m[0][i], m[1][i], m[2][i], m[3][i].
+        // Plane equations use rows of the clip matrix:
+        //   Left:   row3 + row0
+        //   Right:  row3 - row0
+        //   Bottom: row3 + row1
+        //   Top:    row3 - row1
+        //   Near:   row3 + row2
+        //   Far:    row3 - row2
+        let row = |r: usize| -> [f32; 4] { [m[0][r], m[1][r], m[2][r], m[3][r]] };
+        let r0 = row(0); let r1 = row(1); let r2 = row(2); let r3 = row(3);
+
+        let mut planes = [[0.0f32; 4]; 6];
+        for i in 0..4 {
+            planes[0][i] = r3[i] + r0[i]; // left
+            planes[1][i] = r3[i] - r0[i]; // right
+            planes[2][i] = r3[i] + r1[i]; // bottom
+            planes[3][i] = r3[i] - r1[i]; // top
+            planes[4][i] = r3[i] + r2[i]; // near
+            planes[5][i] = r3[i] - r2[i]; // far
+        }
+
+        // Normalize each plane
+        for plane in &mut planes {
+            let len = (plane[0]*plane[0] + plane[1]*plane[1] + plane[2]*plane[2]).sqrt();
+            if len > 1e-8 {
+                let inv = 1.0 / len;
+                plane[0] *= inv;
+                plane[1] *= inv;
+                plane[2] *= inv;
+                plane[3] *= inv;
+            }
+        }
+        Self { planes }
+    }
+
+    /// Test AABB against frustum. Returns true if the box is at least partially inside.
+    #[inline]
+    pub fn test_aabb(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        for plane in &self.planes {
+            // Find the p-vertex: corner most in the direction of the plane normal
+            let px = if plane[0] >= 0.0 { max[0] } else { min[0] };
+            let py = if plane[1] >= 0.0 { max[1] } else { min[1] };
+            let pz = if plane[2] >= 0.0 { max[2] } else { min[2] };
+            // If the p-vertex is outside this plane, the entire AABB is outside
+            if plane[0]*px + plane[1]*py + plane[2]*pz + plane[3] < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 struct ChunkGPUData {
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_memory: vk::DeviceMemory,
     index_count: u32,
+}
+
+/// Pending staging copy: staging buffer/mem to destroy after transfer completes
+struct StagingCopy {
+    staging_buf: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    dst_buf: vk::Buffer,
+    size: u64,
 }
 
 pub struct Renderer {
@@ -75,6 +162,10 @@ pub struct Renderer {
     // Deferred deletion
     deletion_queue: Vec<(u64, vk::Buffer, vk::DeviceMemory)>,
     frame_counter: u64,
+
+    // Staging upload batch
+    pending_copies: Vec<StagingCopy>,
+    upload_fence: vk::Fence,
 }
 
 const MAX_FRAMES: usize = 2;
@@ -119,6 +210,10 @@ impl Renderer {
         let (crosshair_vertex_buffer, crosshair_vertex_memory) =
             Self::create_crosshair_buffer(&device, device_ctx)?;
 
+        let upload_fence = unsafe {
+            device.create_fence(&vk::FenceCreateInfo::default(), None)?
+        };
+
         Ok(Self {
             device,
             chunk_data: HashMap::new(),
@@ -134,6 +229,8 @@ impl Renderer {
             memory_properties: device_ctx.memory_properties,
             deletion_queue: Vec::new(),
             frame_counter: 0,
+            pending_copies: Vec::new(),
+            upload_fence,
         })
     }
 
@@ -153,19 +250,10 @@ impl Renderer {
         let vert_size = (std::mem::size_of::<BlockVertex>() * mesh.vertices.len()) as u64;
         let idx_size = (std::mem::size_of::<u32>() * mesh.indices.len()) as u64;
 
-        let (vb, vm) = Self::create_buffer_with_data(
-            &self.device, device_ctx,
-            &mesh.vertices,
-            vert_size,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-        )?;
-
-        let (ib, im) = Self::create_buffer_with_data(
-            &self.device, device_ctx,
-            &mesh.indices,
-            idx_size,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-        )?;
+        let (vb, vm) = self.stage_buffer_upload(
+            device_ctx, &mesh.vertices, vert_size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let (ib, im) = self.stage_buffer_upload(
+            device_ctx, &mesh.indices, idx_size, vk::BufferUsageFlags::INDEX_BUFFER)?;
 
         self.chunk_data.insert(pos, ChunkGPUData {
             vertex_buffer: vb,
@@ -175,6 +263,75 @@ impl Renderer {
             index_count: mesh.indices.len() as u32,
         });
 
+        Ok(())
+    }
+
+    /// Stage a buffer upload: creates staging + DEVICE_LOCAL buffers, memcpys data into staging,
+    /// and queues a copy. Call `flush_uploads` to submit all pending copies in one batch.
+    fn stage_buffer_upload<T: Copy>(
+        &mut self,
+        device_ctx: &DeviceContext,
+        data: &[T], size: u64, usage: vk::BufferUsageFlags,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
+        unsafe {
+            // HOST_VISIBLE staging
+            let (staging_buf, staging_mem) = Self::create_buffer(&self.device, device_ctx, size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+            let mapped = self.device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, mapped as *mut u8, size as usize);
+            self.device.unmap_memory(staging_mem);
+
+            // DEVICE_LOCAL target
+            let (buf, mem) = Self::create_buffer(&self.device, device_ctx, size,
+                usage | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+
+            self.pending_copies.push(StagingCopy {
+                staging_buf, staging_mem, dst_buf: buf, size,
+            });
+
+            Ok((buf, mem))
+        }
+    }
+
+    /// Submit all pending staging→device copies in one command buffer, wait once.
+    /// Call after all upload_chunk_mesh calls for this frame, before render().
+    pub fn flush_uploads(&mut self, device_ctx: &DeviceContext) -> Result<(), Box<dyn std::error::Error>> {
+        if self.pending_copies.is_empty() { return Ok(()); }
+
+        unsafe {
+            let cmd_buf = self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(device_ctx.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1))?[0];
+
+            self.device.begin_command_buffer(cmd_buf,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+
+            for copy in &self.pending_copies {
+                self.device.cmd_copy_buffer(cmd_buf, copy.staging_buf, copy.dst_buf,
+                    &[vk::BufferCopy::default().size(copy.size)]);
+            }
+
+            self.device.end_command_buffer(cmd_buf)?;
+
+            self.device.reset_fences(&[self.upload_fence])?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&cmd_buf));
+            self.device.queue_submit(device_ctx.queue, &[submit], self.upload_fence)?;
+            self.device.wait_for_fences(&[self.upload_fence], true, u64::MAX)?;
+
+            // Cleanup all staging buffers
+            for copy in self.pending_copies.drain(..) {
+                self.device.destroy_buffer(copy.staging_buf, None);
+                self.device.free_memory(copy.staging_mem, None);
+            }
+
+            self.device.free_command_buffers(device_ctx.command_pool, &[cmd_buf]);
+        }
         Ok(())
     }
 
@@ -205,6 +362,7 @@ impl Renderer {
         &mut self,
         device_ctx: &DeviceContext,
         view_ubo: ViewUBO,
+        frustum: &Frustum,
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             self.device.wait_for_fences(
@@ -291,9 +449,15 @@ impl Renderer {
                 0, push_bytes,
             );
 
-            // Draw each chunk
-            for data in self.chunk_data.values() {
+            // Draw each chunk (frustum culled)
+            for (pos, data) in &self.chunk_data {
                 if data.index_count == 0 { continue; }
+                // Chunk AABB: world-space bounding box
+                let min_x = pos.x as f32 * 16.0;
+                let min_z = pos.z as f32 * 16.0;
+                let aabb_min = [min_x, 0.0, min_z];
+                let aabb_max = [min_x + 16.0, 128.0, min_z + 16.0];
+                if !frustum.test_aabb(aabb_min, aabb_max) { continue; }
                 self.device.cmd_bind_vertex_buffers(cmd, 0, &[data.vertex_buffer], &[0]);
                 self.device.cmd_bind_index_buffer(cmd, data.index_buffer, 0, vk::IndexType::UINT32);
                 self.device.cmd_draw_indexed(cmd, data.index_count, 1, 0, 0, 0);
@@ -449,18 +613,14 @@ impl Renderer {
                 .binding(0).stride(std::mem::size_of::<BlockVertex>() as u32)
                 .input_rate(vk::VertexInputRate::VERTEX);
 
-            // 5 attributes: position, color, normal, ao, light
+            // 3 attributes: position (vec3), color_ao (rgba8 unorm), normal_light (uvec4 as u8x4)
             let attrs = [
                 vk::VertexInputAttributeDescription::default().binding(0).location(0)
-                    .format(vk::Format::R32G32B32_SFLOAT).offset(0),   // position
+                    .format(vk::Format::R32G32B32_SFLOAT).offset(0),         // position: 12 bytes
                 vk::VertexInputAttributeDescription::default().binding(0).location(1)
-                    .format(vk::Format::R32G32B32_SFLOAT).offset(12),  // color
+                    .format(vk::Format::R8G8B8A8_UNORM).offset(12),          // color_ao: auto 0.0-1.0
                 vk::VertexInputAttributeDescription::default().binding(0).location(2)
-                    .format(vk::Format::R32G32B32_SFLOAT).offset(24),  // normal
-                vk::VertexInputAttributeDescription::default().binding(0).location(3)
-                    .format(vk::Format::R32_SFLOAT).offset(36),        // ao
-                vk::VertexInputAttributeDescription::default().binding(0).location(4)
-                    .format(vk::Format::R32_SFLOAT).offset(40),        // light
+                    .format(vk::Format::R8G8B8A8_UINT).offset(16),           // normal_light: integer
             ];
 
             let vi = vk::PipelineVertexInputStateCreateInfo::default()
@@ -633,20 +793,6 @@ impl Renderer {
         Ok((buf, mem))
     }
 
-    fn create_buffer_with_data<T: Copy>(
-        device: &Device, device_ctx: &DeviceContext,
-        data: &[T], size: u64, usage: vk::BufferUsageFlags,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
-        let (buf, mem) = Self::create_buffer(device, device_ctx, size,
-            usage, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
-        unsafe {
-            let mapped = device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, mapped as *mut u8, size as usize);
-            device.unmap_memory(mem);
-        }
-        Ok((buf, mem))
-    }
-
     pub fn recreate_framebuffers(&mut self, device_ctx: &DeviceContext) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             self.device.device_wait_idle()?;
@@ -686,6 +832,12 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
+            // Cleanup any pending staging buffers that weren't flushed
+            for copy in self.pending_copies.drain(..) {
+                self.device.destroy_buffer(copy.staging_buf, None);
+                self.device.free_memory(copy.staging_mem, None);
+            }
+
             for &(_, buffer, memory) in &self.deletion_queue {
                 self.device.destroy_buffer(buffer, None);
                 self.device.free_memory(memory, None);
@@ -698,6 +850,7 @@ impl Drop for Renderer {
                 self.device.free_memory(data.index_memory, None);
             }
 
+            self.device.destroy_fence(self.upload_fence, None);
             for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }
             for &s in &self.render_finished { self.device.destroy_semaphore(s, None); }
             for &s in &self.image_available { self.device.destroy_semaphore(s, None); }

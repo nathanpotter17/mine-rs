@@ -26,6 +26,7 @@ pub struct DeviceContext {
     pub depth_image_memory: vk::DeviceMemory,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub debug_utils: Option<debug_utils::Instance>,
+    pub present_mode: vk::PresentModeKHR,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 }
 
@@ -125,12 +126,13 @@ impl DeviceContext {
             
             let caps = surface_loader.get_physical_device_surface_capabilities(physical_device, surface)?;
             let swapchain_loader = swapchain::Device::new(&instance, &device);
+            let present_mode = Self::select_present_mode(&surface_loader, physical_device, surface);
             let swapchain = swapchain_loader.create_swapchain(&vk::SwapchainCreateInfoKHR::default()
                 .surface(surface).min_image_count(caps.min_image_count + 1)
                 .image_color_space(surface_format.color_space).image_format(surface_format.format)
                 .image_extent(caps.current_extent).image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE).pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE).present_mode(vk::PresentModeKHR::FIFO)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE).present_mode(present_mode)
                 .clipped(true).image_array_layers(1), None)?;
             
             let images = swapchain_loader.get_swapchain_images(swapchain)?;
@@ -181,7 +183,7 @@ impl DeviceContext {
                 surface_format, swapchain_loader, swapchain, swapchain_images: images,
                 swapchain_image_views: views, swapchain_extent: caps.current_extent,
                 command_pool, depth_image, depth_image_view, depth_image_memory, 
-                memory_properties, debug_utils, debug_messenger,
+                memory_properties, present_mode, debug_utils, debug_messenger,
             })
         }
     }
@@ -208,7 +210,7 @@ impl DeviceContext {
                 .image_color_space(self.surface_format.color_space).image_format(self.surface_format.format)
                 .image_extent(extent).image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE).pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
-                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE).present_mode(vk::PresentModeKHR::FIFO)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE).present_mode(self.present_mode)
                 .clipped(true).image_array_layers(1).old_swapchain(old), None).unwrap();
             
             self.swapchain_loader.destroy_swapchain(old, None);
@@ -253,6 +255,31 @@ impl DeviceContext {
                     aspect_mask: vk::ImageAspectFlags::DEPTH, base_mip_level: 0,
                     level_count: 1, base_array_layer: 0, layer_count: 1,
                 }).image(self.depth_image), None).unwrap();
+        }
+    }
+
+    /// Select lowest-latency present mode available on this surface.
+    /// Priority: MAILBOX (no-tear, uncapped) > IMMEDIATE (tearing, uncapped) > FIFO (vsync).
+    fn select_present_mode(
+        surface_loader: &surface::Instance,
+        physical_device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> vk::PresentModeKHR {
+        let modes = unsafe {
+            surface_loader
+                .get_physical_device_surface_present_modes(physical_device, surface)
+                .unwrap_or_default()
+        };
+
+        if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+            println!("[present] Using MAILBOX (low-latency, no tearing)");
+            vk::PresentModeKHR::MAILBOX
+        } else if modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            println!("[present] Using IMMEDIATE (low-latency, may tear)");
+            vk::PresentModeKHR::IMMEDIATE
+        } else {
+            println!("[present] Falling back to FIFO (vsync)");
+            vk::PresentModeKHR::FIFO
         }
     }
 }

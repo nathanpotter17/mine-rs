@@ -7,7 +7,7 @@ use simmerlib::{
     device::{DeviceContext, WINDOW_NAME},
     world::{World, BlockType, CHUNK_X, CHUNK_Z, RENDER_DISTANCE, GENERATION_DISTANCE, mesh_chunk, ChunkPos},
     player::{Player, PlayerInput},
-    renderer::{Renderer, ViewUBO},
+    renderer::{Renderer, ViewUBO, Frustum},
 };
 
 const WIDTH: u32 = 1280;
@@ -73,6 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Flush all initial staging uploads to DEVICE_LOCAL
+    renderer.flush_uploads(&device_ctx)?;
     // Mark only meshed chunks as clean (buffer ring stays dirty until it enters view)
     for pos in &chunk_positions {
         if let Some(chunk) = world.chunks.get_mut(pos) {
@@ -92,6 +94,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_fps = 0;
 
     let mut input = PlayerInput::default();
+
+    // Frame timing accumulators (printed every second)
+    let mut t_events = 0.0f64;
+    let mut t_update = 0.0f64;
+    let mut t_world = 0.0f64;
+    let mut t_upload = 0.0f64;
+    let mut t_unload = 0.0f64;
+    let mut t_render = 0.0f64;
+    let mut t_frames = 0u32;
 
     println!("\n═══════════════════════════════════");
     println!("  Controls:");
@@ -116,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // FPS counter
         frame_count += 1;
+        t_frames += 1;
         if fps_timer.elapsed().as_secs_f32() >= 1.0 {
             last_fps = frame_count;
             frame_count = 0;
@@ -126,6 +138,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let looking_at = world.raycast(player.eye_position(), player.forward(), 6.0)
                 .map(|hit| format!("{:?}", hit.block_type))
                 .unwrap_or_else(|| "---".to_string());
+
+            let n = t_frames.max(1) as f64;
+            println!("  events={:.1}ms update={:.1}ms world={:.1}ms upload={:.1}ms unload={:.1}ms render={:.1}ms",
+                t_events/n*1000.0, t_update/n*1000.0, t_world/n*1000.0,
+                t_upload/n*1000.0, t_unload/n*1000.0, t_render/n*1000.0);
+            t_events = 0.0; t_update = 0.0; t_world = 0.0;
+            t_upload = 0.0; t_unload = 0.0; t_render = 0.0; t_frames = 0;
+
             window.set_title(&format!(
                 "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | Chunks: {} | Looking: {} | Place: {:?}",
                 last_fps, pos[0], pos[1], pos[2], mode,
@@ -137,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input.toggle_fly = false;
 
         // Events
+        let t0 = Instant::now();
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -233,26 +254,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Update player
+        t_events += t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
         player.update(dt, &input, &world);
 
         // === Async world update ===
-        // generate_around() now:
-        //   1. Drains completed chunk generations from background threads
-        //   2. Submits new gen requests (spiral priority)
-        //   3. Propagates light for edited chunks
-        //   4. Submits dirty chunks for background meshing (snapshot + send to workers)
-        //   5. Prefetches heightmaps ahead of player
+        t_update += t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
         world.generate_around(player.position[0], player.position[2]);
 
         // === Drain completed meshes from background workers and upload to GPU ===
-        // This is the ONLY meshing-related work on the main thread.
-        // Each upload: ~0.1-0.2ms (vkCreateBuffer + memcpy). Typically 2-4 per frame.
+        t_world += t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
         let completed_meshes = world.drain_completed_meshes();
         for mesh in &completed_meshes {
             renderer.upload_chunk_mesh(&device_ctx, mesh.pos, mesh)?;
         }
+        // Submit all staging→device copies in one command buffer
+        renderer.flush_uploads(&device_ctx)?;
 
         // Remove GPU data for chunks that left render distance
+        t_upload += t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
         let pcx = (player.position[0] / CHUNK_X as f32).floor() as i32;
         let pcz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
         let gpu_chunks: Vec<ChunkPos> = renderer.loaded_chunk_positions();
@@ -264,16 +287,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Render
+        t_unload += t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
         let aspect = device_ctx.swapchain_extent.width as f32 / device_ctx.swapchain_extent.height as f32;
         let eye = player.eye_position();
 
+        let view = player.get_view_matrix();
+        let proj = player.get_projection_matrix(aspect);
+        let frustum = Frustum::from_view_proj(&view, &proj);
+
         let ubo = ViewUBO {
-            view: player.get_view_matrix(),
-            proj: player.get_projection_matrix(aspect),
+            view,
+            proj,
             camera_pos: [eye[0], eye[1], eye[2], 0.0],
         };
 
-        renderer.render(&device_ctx, ubo)?;
+        renderer.render(&device_ctx, ubo, &frustum)?;
+        t_render += t0.elapsed().as_secs_f64();
     }
 
     println!("\nShutting down...");
