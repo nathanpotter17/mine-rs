@@ -122,7 +122,15 @@ impl DeviceContext {
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             
             let formats = surface_loader.get_physical_device_surface_formats(physical_device, surface)?;
-            let surface_format = formats.first().copied().ok_or("No formats")?;
+            let surface_format = formats.iter()
+                .find(|f| {
+                    (f.format == vk::Format::B8G8R8A8_SRGB
+                     || f.format == vk::Format::R8G8B8A8_SRGB)
+                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+                })
+                .or_else(|| formats.first())
+                .copied()
+                .ok_or("No surface formats available")?;
             
             let caps = surface_loader.get_physical_device_surface_capabilities(physical_device, surface)?;
             let swapchain_loader = swapchain::Device::new(&instance, &device);

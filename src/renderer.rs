@@ -4,6 +4,17 @@ use std::sync::Arc;
 use crate::device::DeviceContext;
 use crate::world::{BlockVertex, ChunkMesh, ChunkPos};
 
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 // Push constant for fog / view info
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -11,7 +22,8 @@ pub struct PushConstants {
     pub fog_color: [f32; 4],
     pub fog_start: f32,
     pub fog_end: f32,
-    pub sun_dir: [f32; 2], // packed x,z (y derived)
+    pub time_of_day: f32,    // 0.0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
+    pub sun_intensity: f32,  // 0.0=full night, 1.0=full day (smooth, derived from time)
 }
 
 // UBO: just view-projection
@@ -132,6 +144,10 @@ pub struct Renderer {
     crosshair_vertex_buffer: vk::Buffer,
     crosshair_vertex_memory: vk::DeviceMemory,
 
+    // Sky pass
+    sky_pipeline: vk::Pipeline,
+    sky_pipeline_layout: vk::PipelineLayout,
+
     // Cached
     memory_properties: vk::PhysicalDeviceMemoryProperties,
 
@@ -197,6 +213,10 @@ impl Renderer {
         let (crosshair_vertex_buffer, crosshair_vertex_memory) =
             Self::create_crosshair_buffer(&device, device_ctx)?;
 
+        let (sky_pipeline, sky_pipeline_layout) =
+            Self::create_sky_pipeline(&device, render_pass, descriptor_set_layout)?;
+        println!("  ✓ Sky pipeline created");
+
         let upload_fence = unsafe {
             device.create_fence(&vk::FenceCreateInfo::default(), None)?
         };
@@ -214,6 +234,7 @@ impl Renderer {
             current_frame: 0,
             crosshair_pipeline, crosshair_pipeline_layout,
             crosshair_vertex_buffer, crosshair_vertex_memory,
+            sky_pipeline, sky_pipeline_layout,
             memory_properties: device_ctx.memory_properties,
             deletion_queue: Vec::new(),
             frame_counter: 0,
@@ -477,6 +498,7 @@ impl Renderer {
         device_ctx: &DeviceContext,
         view_ubo: ViewUBO,
         frustum: &Frustum,
+        time_of_day: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             self.device.wait_for_fences(
@@ -506,10 +528,37 @@ impl Renderer {
             self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             self.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
 
-            let sky = [0.53, 0.72, 0.92, 1.0];
+            // === Compute time-of-day lighting parameters ===
+            let sun_angle = time_of_day * std::f32::consts::TAU;
+            let sun_elevation = sun_angle.sin(); // -1..1
+
+            // sun_intensity: smooth ramp — matches sky.frag's dayFactor
+            let sun_intensity = smoothstep(-0.1, 0.3, sun_elevation);
+
+            // === Fog color — MUST match sky.frag horizon calculation exactly ===
+            // These constants are duplicated from sky.frag. If you change one, change both.
+            let day_horizon:    [f32; 3] = [0.65, 0.78, 0.95];
+            let night_horizon:  [f32; 3] = [0.03, 0.04, 0.08];
+            let sunset_color:   [f32; 3] = [0.95, 0.45, 0.15];
+
+            // Sunset band factor — same formula as sky.frag
+            let sunset_band = smoothstep(-0.05, 0.15, sun_elevation)
+                            * (1.0 - smoothstep(0.15, 0.45, sun_elevation));
+
+            // Horizon color = mix(night, day, intensity) then blend sunset
+            let mut fog = [0.0f32; 4];
+            for i in 0..3 {
+                let base = lerp(night_horizon[i], day_horizon[i], sun_intensity);
+                fog[i] = lerp(base, sunset_color[i], sunset_band * 0.7);
+            }
+            fog[3] = 1.0;
+
+            // Fog distances: shorter at night for atmosphere
+            let fog_start = lerp(35.0, 60.0, sun_intensity);
+            let fog_end   = lerp(55.0, 90.0, sun_intensity);
 
             let clear_values = [
-                vk::ClearValue { color: vk::ClearColorValue { float32: sky } },
+                vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } },
                 vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
             ];
 
@@ -536,23 +585,38 @@ impl Renderer {
                 extent: device_ctx.swapchain_extent,
             }]);
 
-            // Draw world chunks
+            let push = PushConstants {
+                fog_color: fog,
+                fog_start,
+                fog_end,
+                time_of_day,
+                sun_intensity,
+            };
+            let push_bytes: &[u8] = std::slice::from_raw_parts(
+                &push as *const PushConstants as *const u8,
+                std::mem::size_of::<PushConstants>(),
+            );
+
+            // === Pass 1: Sky (fullscreen triangle — no vertex buffer) ===
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sky_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::GRAPHICS,
+                self.sky_pipeline_layout, 0,
+                &[self.descriptor_sets[self.current_frame]], &[],
+            );
+            self.device.cmd_push_constants(
+                cmd, self.sky_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0, push_bytes,
+            );
+            self.device.cmd_draw(cmd, 3, 1, 0, 0); // 3 verts, no buffer
+
+            // === Pass 2: World chunks ===
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
                 cmd, vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout, 0,
                 &[self.descriptor_sets[self.current_frame]], &[],
-            );
-
-            let push = PushConstants {
-                fog_color: sky,
-                fog_start: 60.0,
-                fog_end: 90.0,
-                sun_dir: [0.4, 0.3],
-            };
-            let push_bytes: &[u8] = std::slice::from_raw_parts(
-                &push as *const PushConstants as *const u8,
-                std::mem::size_of::<PushConstants>(),
             );
             self.device.cmd_push_constants(
                 cmd, self.pipeline_layout,
@@ -572,7 +636,7 @@ impl Renderer {
                 self.device.cmd_draw_indexed(cmd, data.index_count, 1, 0, 0, 0);
             }
 
-            // Draw crosshair
+            // === Pass 3: Crosshair overlay ===
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.crosshair_pipeline);
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.crosshair_vertex_buffer], &[0]);
             self.device.cmd_draw(cmd, 12, 1, 0, 0);
@@ -875,6 +939,80 @@ impl Renderer {
         }
     }
 
+    fn create_sky_pipeline(
+        device: &Device, render_pass: vk::RenderPass,
+        desc_layout: vk::DescriptorSetLayout,
+    ) -> Result<(vk::Pipeline, vk::PipelineLayout), Box<dyn std::error::Error>> {
+        unsafe {
+            let vert_code = align_spv(include_bytes!("../shaders/compiled/sky.vert.spv"));
+            let frag_code = align_spv(include_bytes!("../shaders/compiled/sky.frag.spv"));
+            let vert_mod = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&vert_code), None)?;
+            let frag_mod = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&frag_code), None)?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX).module(vert_mod).name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_mod).name(c"main"),
+            ];
+
+            // No vertex input — fullscreen triangle generated from gl_VertexIndex
+            let vi = vk::PipelineVertexInputStateCreateInfo::default();
+            let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let vp = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1).scissor_count(1);
+            let rs = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL).line_width(1.0)
+                .cull_mode(vk::CullModeFlags::NONE);
+            let ms = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+            // Depth: write enabled at far plane (0.9999) so blocks draw in front,
+            // but test disabled so the sky always draws as background
+            let ds = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(false)
+                .depth_write_enable(false);
+
+            let cba = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false);
+            let cb = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&cba));
+            let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dyn_state = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dyn_states);
+
+            // Shares the same layout as the block pipeline (UBO + push constants)
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                .offset(0)
+                .size(std::mem::size_of::<PushConstants>() as u32);
+
+            let layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(std::slice::from_ref(&desc_layout))
+                    .push_constant_ranges(std::slice::from_ref(&push_range)), None)?;
+
+            let pi = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages).vertex_input_state(&vi).input_assembly_state(&ia)
+                .viewport_state(&vp).rasterization_state(&rs).multisample_state(&ms)
+                .depth_stencil_state(&ds).color_blend_state(&cb).dynamic_state(&dyn_state)
+                .layout(layout).render_pass(render_pass).subpass(0);
+
+            let pipelines = device.create_graphics_pipelines(
+                vk::PipelineCache::null(), &[pi], None)
+                .map_err(|(_, e)| e)?;
+
+            device.destroy_shader_module(vert_mod, None);
+            device.destroy_shader_module(frag_mod, None);
+
+            Ok((pipelines[0], layout))
+        }
+    }
+
     fn create_crosshair_buffer(
         device: &Device, device_ctx: &DeviceContext,
     ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
@@ -972,52 +1110,59 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
-            for copy in self.pending_copies.drain(..) {
-                self.device.destroy_buffer(copy.staging_buf, None);
-                self.device.free_memory(copy.staging_mem, None);
-            }
-
+            // Flush any remaining deletion queue items
             for &(_, buffer, memory) in &self.deletion_queue {
                 self.device.destroy_buffer(buffer, None);
                 self.device.free_memory(memory, None);
             }
 
-            for data in self.chunk_data.values() {
+            // Destroy chunk GPU data
+            for (_, data) in self.chunk_data.drain() {
                 self.device.destroy_buffer(data.vertex_buffer, None);
                 self.device.free_memory(data.vertex_memory, None);
                 self.device.destroy_buffer(data.index_buffer, None);
                 self.device.free_memory(data.index_memory, None);
             }
 
-            // Texture atlas cleanup
+            // Pipelines
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_pipeline(self.crosshair_pipeline, None);
+            self.device.destroy_pipeline_layout(self.crosshair_pipeline_layout, None);
+            self.device.destroy_pipeline(self.sky_pipeline, None);
+            self.device.destroy_pipeline_layout(self.sky_pipeline_layout, None);
+
+            // Crosshair vertex buffer
+            self.device.destroy_buffer(self.crosshair_vertex_buffer, None);
+            self.device.free_memory(self.crosshair_vertex_memory, None);
+
+            // Texture atlas
             self.device.destroy_sampler(self.atlas_sampler, None);
             self.device.destroy_image_view(self.atlas_view, None);
             self.device.destroy_image(self.atlas_image, None);
             self.device.free_memory(self.atlas_memory, None);
 
-            self.device.destroy_fence(self.upload_fence, None);
-            for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }
-            for &s in &self.render_finished { self.device.destroy_semaphore(s, None); }
-            for &s in &self.image_available { self.device.destroy_semaphore(s, None); }
-
+            // Descriptors
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
-            for &fb in &self.framebuffers { self.device.destroy_framebuffer(fb, None); }
-
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_pipeline(self.crosshair_pipeline, None);
-            self.device.destroy_pipeline_layout(self.crosshair_pipeline_layout, None);
-
-            self.device.destroy_render_pass(self.render_pass, None);
-
-            self.device.unmap_memory(self.uniform_memory);
+            // Uniform
             self.device.destroy_buffer(self.uniform_buffer, None);
             self.device.free_memory(self.uniform_memory, None);
 
-            self.device.destroy_buffer(self.crosshair_vertex_buffer, None);
-            self.device.free_memory(self.crosshair_vertex_memory, None);
+            // Framebuffers + render pass
+            for &fb in &self.framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            self.device.destroy_render_pass(self.render_pass, None);
+
+            // Sync
+            for i in 0..self.image_available.len() {
+                self.device.destroy_semaphore(self.image_available[i], None);
+                self.device.destroy_semaphore(self.render_finished[i], None);
+                self.device.destroy_fence(self.in_flight_fences[i], None);
+            }
+            self.device.destroy_fence(self.upload_fence, None);
         }
     }
 }

@@ -93,6 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fps_timer = Instant::now();
     let mut last_fps = 0;
 
+    let mut game_time: f32 = 0.30;  // start at "morning" (sunrise = 0.25, noon = 0.5)
+    let day_length_seconds: f32 = 600.0;  // 10 real minutes = 1 game day
+
     let mut input = PlayerInput::default();
 
     // Frame timing accumulators (printed every second)
@@ -124,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let dt = now.duration_since(last_frame).as_secs_f32().min(0.1);
         last_frame = now;
+        game_time = (game_time + dt / day_length_seconds) % 1.0;
 
         // FPS counter
         frame_count += 1;
@@ -146,10 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             t_events = 0.0; t_update = 0.0; t_world = 0.0;
             t_upload = 0.0; t_unload = 0.0; t_render = 0.0; t_frames = 0;
 
+            let time_hours = (game_time * 24.0) as u32;
+            let time_mins = ((game_time * 24.0 - time_hours as f32) * 60.0) as u32;
             window.set_title(&format!(
-                "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | Chunks: {} | Looking: {} | Place: {:?}",
+                "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | Chunks: {} | {:02}:{:02} | Place: {:?}",
                 last_fps, pos[0], pos[1], pos[2], mode,
-                renderer.chunk_count(), looking_at, player.selected_block,
+                renderer.chunk_count(), time_hours, time_mins, player.selected_block,
             )).ok();
         }
 
@@ -283,6 +289,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if (pos.x - pcx).abs() > RENDER_DISTANCE + 1
             || (pos.z - pcz).abs() > RENDER_DISTANCE + 1 {
                 renderer.remove_chunk(pos);
+                // Re-mark dirty so chunk gets re-meshed when back in range
+                if let Some(chunk) = world.chunks.get_mut(&pos) {
+                    chunk.dirty = true;
+                }
             }
         }
 
@@ -302,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             camera_pos: [eye[0], eye[1], eye[2], 0.0],
         };
 
-        renderer.render(&device_ctx, ubo, &frustum)?;
+        renderer.render(&device_ctx, ubo, &frustum, game_time)?;
         t_render += t0.elapsed().as_secs_f64();
     }
 

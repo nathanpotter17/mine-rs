@@ -15,6 +15,8 @@ shaders=(
     "basic.frag:basic.frag.spv"
     "crosshair.vert:crosshair.vert.spv"
     "crosshair.frag:crosshair.frag.spv"
+    "sky.vert:sky.vert.spv"
+    "sky.frag:sky.frag.spv"
 )
 
 compile_shaders() {

@@ -6,11 +6,13 @@ layout(binding = 0) uniform ViewUBO {
     vec4 camera_pos;
 } ubo;
 
+// CHANGED: replaced sun_dir with time_of_day + sun_intensity
 layout(push_constant) uniform PushConstants {
     vec4 fog_color;
     float fog_start;
     float fog_end;
-    vec2 sun_dir;
+    float time_of_day;
+    float sun_intensity;
 } pc;
 
 // Compact vertex inputs (20 bytes total — unchanged from pre-texture layout)

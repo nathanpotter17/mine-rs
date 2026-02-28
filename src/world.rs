@@ -717,9 +717,13 @@ impl MeshPool {
         Self { tx: req_tx, rx: res_rx, in_flight: HashMap::new(), _workers: workers, shutdown }
     }
 
-    pub fn submit(&mut self, pos: ChunkPos, chunks: &HashMap<ChunkPos, Chunk>) {
-        if self.in_flight.contains_key(&pos) { return; }
-        let center = match chunks.get(&pos) { Some(c) => ChunkSnapshot::from_chunk(c), None => return };
+    /// Returns true if the mesh job was actually sent to the worker pool.
+    pub fn submit(&mut self, pos: ChunkPos, chunks: &HashMap<ChunkPos, Chunk>) -> bool {
+        if self.in_flight.contains_key(&pos) { return true; } // already queued
+        let center = match chunks.get(&pos) {
+            Some(c) => ChunkSnapshot::from_chunk(c),
+            None => return false,
+        };
         let snap = |p: ChunkPos| chunks.get(&p).map(ChunkSnapshot::from_chunk);
         let job = MeshJob {
             center,
@@ -728,7 +732,12 @@ impl MeshPool {
             northeast: snap(ChunkPos::new(pos.x+1,pos.z+1)), northwest: snap(ChunkPos::new(pos.x-1,pos.z+1)),
             southeast: snap(ChunkPos::new(pos.x+1,pos.z-1)), southwest: snap(ChunkPos::new(pos.x-1,pos.z-1)),
         };
-        if self.tx.try_send(job).is_ok() { self.in_flight.insert(pos, ()); }
+        if self.tx.try_send(job).is_ok() {
+            self.in_flight.insert(pos, ());
+            true
+        } else {
+            false  // channel full — caller must NOT clear dirty
+        }
     }
 
     pub fn drain(&mut self) -> Vec<ChunkMesh> {
@@ -943,9 +952,12 @@ impl World {
         for pos in dirty {
             if submitted >= 4 { break; }
             if !self.has_all_neighbors(pos) { continue; }
-            self.mesh_pool.submit(pos, &self.chunks);
-            if let Some(c) = self.chunks.get_mut(&pos) { c.dirty = false; }
-            submitted += 1;
+            let actually_sent = self.mesh_pool.submit(pos, &self.chunks);
+            if actually_sent {
+                if let Some(c) = self.chunks.get_mut(&pos) { c.dirty = false; }
+                submitted += 1;
+            }
+            // If not sent (channel full), dirty stays true → retried next frame
         }
     }
 
