@@ -24,8 +24,25 @@ impl BlockType {
         T[self as usize]
     }
     pub fn is_light_source(self) -> bool { matches!(self, BlockType::Torch) }
-    pub fn light_level(self) -> u8 { match self { BlockType::Torch => 14, _ => 0 } }
+    pub fn light_level(self) -> u8 { match self { BlockType::Torch => 15, _ => 0 } }
 
+    /// Tile index into the 16×16 texture atlas.
+    /// Row 0 (tiles 0-15)  = top faces
+    /// Row 1 (tiles 16-31) = side faces
+    /// Row 2 (tiles 32-47) = bottom faces
+    #[inline(always)]
+    pub fn tile_index(self, face: Face) -> u8 {
+        let base = self as u8;
+        match face {
+            Face::Top    => base,       // row 0
+            Face::Bottom => 32 + base,  // row 2
+            _            => 16 + base,  // row 1: all sides
+        }
+    }
+
+    /// Per-face tint color that modulates the atlas texture.
+    /// These are intentionally brighter than before since the texture provides
+    /// its own color variation — the tint is for face-dependent shading and biome hints.
     pub fn colors(self) -> ([f32; 3], [f32; 3], [f32; 3]) {
         match self {
             BlockType::Grass   => ([0.30,0.65,0.20],[0.45,0.35,0.20],[0.45,0.32,0.18]),
@@ -193,10 +210,10 @@ impl Chunk {
 }
 
 // ===== Mesh Vertex =====
-// Compact 20-byte vertex (down from 44 bytes = 2.2× less bandwidth)
+// Compact 20-byte vertex (unchanged size from pre-texture version)
 //   position:     [f32; 3]  = 12 bytes
-//   color_ao:     u32       = 4 bytes  (R8G8B8 color + A8 AO, UNORM → auto 0.0-1.0)
-//   normal_light: u32       = 4 bytes  (R8=normal_idx, G8=light_u8, B8A8=reserved)
+//   color_ao:     u32       = 4 bytes  (R8G8B8 tint color + A8 AO, UNORM → auto 0.0-1.0)
+//   normal_light: u32       = 4 bytes  (R8=normal_idx, G8=light_u8, B8=tile_index, A8=uv_corner)
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -207,16 +224,29 @@ pub struct BlockVertex {
 }
 
 impl BlockVertex {
-    /// Pack color [f32;3], AO f32 (0/3..3/3), normal index u8 (0-5), light f32 (0.0-1.0)
+    /// Pack tint color, AO, normal, light, tile_index, uv_corner into 20 bytes.
+    ///
+    /// - `color`: [f32;3] tint that modulates the atlas texture
+    /// - `normal_idx`: 0-5 (Face enum order)
+    /// - `ao`: 0.0-1.0 ambient occlusion
+    /// - `light`: 0.0-1.0 light level
+    /// - `tile_index`: 0-255 atlas tile (row*16 + col in 16×16 grid)
+    /// - `uv_corner`: 0-3 which quad corner (0=TL, 1=TR, 2=BR, 3=BL)
     #[inline]
-    pub fn new(position: [f32; 3], color: [f32; 3], normal_idx: u8, ao: f32, light: f32) -> Self {
+    pub fn new(
+        position: [f32; 3], color: [f32; 3], normal_idx: u8,
+        ao: f32, light: f32, tile_index: u8, uv_corner: u8,
+    ) -> Self {
         let r = (color[0] * 255.0 + 0.5) as u8;
         let g = (color[1] * 255.0 + 0.5) as u8;
         let b = (color[2] * 255.0 + 0.5) as u8;
         let a = (ao.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         let color_ao = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24);
         let light_u8 = (light.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        let normal_light = (normal_idx as u32) | ((light_u8 as u32) << 8);
+        let normal_light = (normal_idx as u32)
+            | ((light_u8 as u32) << 8)
+            | ((tile_index as u32) << 16)
+            | ((uv_corner as u32) << 24);
         Self { position, color_ao, normal_light }
     }
 }
@@ -293,7 +323,7 @@ static LIGHT_OFFSETS: [[[(i32,i32,i32);3];4];6] = [
 const INV_3: f32 = 1.0 / 3.0;
 const INV_LX15: f32 = 1.0 / (4.0 * 15.0);
 
-// ===== Generic AO/Light computation (works with closures for both Chunk and Snapshot) =====
+// ===== Generic AO/Light computation =====
 
 #[inline]
 fn compute_ao_generic(x: i32, y: i32, z: i32, face: Face, get: &impl Fn(i32,i32,i32)->BlockType) -> [u8;4] {
@@ -325,42 +355,48 @@ fn compute_light_generic(x: i32, y: i32, z: i32, face: Face, get: &impl Fn(i32,i
 
 // ===== Mesh geometry emission =====
 
-fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32, z: f32, light_val: f32) {
-    let color = [0.95,0.82,0.35]; let cx = x+0.5; let cz = z+0.5;
-    let r = 0.1; let h = 0.65;
+fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32, z: f32, _light_val: f32) {
+    // Proper 3D box torch: 4 sides + top. No cross-billboard nonsense.
+    // Self-illuminated: AO=1.0, light=1.0 for full brightness.
+    let color = [0.95, 0.85, 0.50];
+    let cx = x + 0.5; let cz = z + 0.5;
+    let r = 0.0625;    // half-width: 1 pixel at 16px/block
+    let h = 0.625;     // 10/16 of a block tall
+    let tile = BlockType::Torch.tile_index(Face::South);
 
-    // North face (normal_idx=2)
-    let base = verts.len() as u32;
-    verts.push(BlockVertex::new([cx-r,y,cz],   color, 2, 1.0, light_val));
-    verts.push(BlockVertex::new([cx+r,y,cz],   color, 2, 1.0, light_val));
-    verts.push(BlockVertex::new([cx+r,y+h,cz], color, 2, 1.0, light_val));
-    verts.push(BlockVertex::new([cx-r,y+h,cz], color, 2, 1.0, light_val));
-    idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
-    idxs.extend_from_slice(&[base+2,base+1,base, base,base+3,base+2]);
+    // Helper: emit one quad with correct winding
+    let mut quad = |v0: [f32;3], v1: [f32;3], v2: [f32;3], v3: [f32;3], ni: u8, c: [f32;3], ti: u8| {
+        let base = verts.len() as u32;
+        verts.push(BlockVertex::new(v0, c, ni, 1.0, 1.0, ti, 0));
+        verts.push(BlockVertex::new(v1, c, ni, 1.0, 1.0, ti, 1));
+        verts.push(BlockVertex::new(v2, c, ni, 1.0, 1.0, ti, 2));
+        verts.push(BlockVertex::new(v3, c, ni, 1.0, 1.0, ti, 3));
+        idxs.extend_from_slice(&[base, base+1, base+2, base+2, base+3, base]);
+    };
 
-    // East face (normal_idx=4)
-    let base = verts.len() as u32;
-    verts.push(BlockVertex::new([cx,y,cz-r],   color, 4, 1.0, light_val));
-    verts.push(BlockVertex::new([cx,y,cz+r],   color, 4, 1.0, light_val));
-    verts.push(BlockVertex::new([cx,y+h,cz+r], color, 4, 1.0, light_val));
-    verts.push(BlockVertex::new([cx,y+h,cz-r], color, 4, 1.0, light_val));
-    idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
-    idxs.extend_from_slice(&[base+2,base+1,base, base,base+3,base+2]);
+    let (x0, x1) = (cx - r, cx + r);
+    let (z0, z1) = (cz - r, cz + r);
+    let (y0, y1) = (y, y + h);
 
-    // Top face (normal_idx=0) — flame
-    let flame = [1.0,0.65,0.15];
-    let base = verts.len() as u32;
-    verts.push(BlockVertex::new([cx-r,y+h,cz-r], flame, 0, 1.0, 1.0));
-    verts.push(BlockVertex::new([cx+r,y+h,cz-r], flame, 0, 1.0, 1.0));
-    verts.push(BlockVertex::new([cx+r,y+h,cz+r], flame, 0, 1.0, 1.0));
-    verts.push(BlockVertex::new([cx-r,y+h,cz+r], flame, 0, 1.0, 1.0));
-    idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
+    // North face (+Z, normal_idx=2)
+    quad([x1,y0,z1],[x0,y0,z1],[x0,y1,z1],[x1,y1,z1], 2, color, tile);
+    // South face (-Z, normal_idx=3)
+    quad([x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0], 3, color, tile);
+    // East face (+X, normal_idx=4)
+    quad([x1,y0,z0],[x1,y0,z1],[x1,y1,z1],[x1,y1,z0], 4, color, tile);
+    // West face (-X, normal_idx=5)
+    quad([x0,y0,z1],[x0,y0,z0],[x0,y1,z0],[x0,y1,z1], 5, color, tile);
+
+    // Top face — flame (brighter orange, normal_idx=0)
+    let flame = [1.0, 0.7, 0.2];
+    let flame_tile = BlockType::Torch.tile_index(Face::Top);
+    quad([x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1], 0, flame, flame_tile);
 }
 
 fn add_face_ao(
     verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>,
     x: f32, y: f32, z: f32, face: Face, color: [f32;3],
-    ao: [f32;4], light: [f32;4], ao_raw: [u8;4],
+    ao: [f32;4], light: [f32;4], ao_raw: [u8;4], tile_index: u8,
 ) {
     let base = verts.len() as u32;
     let ni = face as u8;
@@ -372,10 +408,11 @@ fn add_face_ao(
         Face::East   => ([x+1.0,y,z],[x+1.0,y,z+1.0],[x+1.0,y+1.0,z+1.0],[x+1.0,y+1.0,z]),
         Face::West   => ([x,y,z+1.0],[x,y,z],[x,y+1.0,z],[x,y+1.0,z+1.0]),
     };
-    verts.push(BlockVertex::new(v0, color, ni, ao[0], light[0]));
-    verts.push(BlockVertex::new(v1, color, ni, ao[1], light[1]));
-    verts.push(BlockVertex::new(v2, color, ni, ao[2], light[2]));
-    verts.push(BlockVertex::new(v3, color, ni, ao[3], light[3]));
+    // uv_corner 0-3 maps to quad corners: v0=TL, v1=TR, v2=BR, v3=BL
+    verts.push(BlockVertex::new(v0, color, ni, ao[0], light[0], tile_index, 0));
+    verts.push(BlockVertex::new(v1, color, ni, ao[1], light[1], tile_index, 1));
+    verts.push(BlockVertex::new(v2, color, ni, ao[2], light[2], tile_index, 2));
+    verts.push(BlockVertex::new(v3, color, ni, ao[3], light[3], tile_index, 3));
     if ao_raw[0] + ao_raw[2] > ao_raw[1] + ao_raw[3] {
         idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
     } else {
@@ -408,7 +445,8 @@ fn mesh_inner(
                 let ao_raw = compute_ao_generic(ix,iy,iz,face,&get_nb_block);
                 let ao = [ao_raw[0] as f32*INV_3, ao_raw[1] as f32*INV_3, ao_raw[2] as f32*INV_3, ao_raw[3] as f32*INV_3];
                 let light = compute_light_generic(ix,iy,iz,face,&get_nb_light);
-                add_face_ao(verts, idxs, wx, wy, wz, face, block.color_for_face(face), ao, light, ao_raw);
+                let tile = block.tile_index(face);
+                add_face_ao(verts, idxs, wx, wy, wz, face, block.color_for_face(face), ao, light, ao_raw, tile);
             }
         }
     }}}
@@ -519,9 +557,6 @@ fn compute_column(wx: f32, wz: f32, lx: usize, lz: usize, noise: &Noise, tree_no
 }
 
 // ===== Chunk Snapshot for off-thread meshing =====
-// mesh_chunk needs &Chunk + 8 &Chunk neighbors (borrows into World.chunks).
-// Can't send borrows to threads. Solution: memcpy block+light arrays into owned snapshot.
-// 9 chunks × 64KB = 576KB per snapshot ≈ 0.05ms to build, fits in L2.
 
 struct ChunkSnapshot {
     blocks: Vec<BlockType>, light_map: Vec<u8>,
@@ -554,7 +589,6 @@ struct MeshJob {
     southeast: Option<ChunkSnapshot>, southwest: Option<ChunkSnapshot>,
 }
 
-// Snapshot neighbor resolution — mirrors resolve_chunk but for snapshots
 #[inline(always)]
 fn snap_resolve<'a>(c: &'a ChunkSnapshot, n: &'a MeshJob, x: i32, z: i32) -> (Option<&'a ChunkSnapshot>, usize, usize) {
     let (xn,xp,zn,zp) = (x<0, x>=CHUNK_X as i32, z<0, z>=CHUNK_Z as i32);
@@ -571,7 +605,6 @@ fn snap_resolve<'a>(c: &'a ChunkSnapshot, n: &'a MeshJob, x: i32, z: i32) -> (Op
     (t, lx, lz)
 }
 
-/// Mesh a chunk from snapshot data. Runs entirely off-thread.
 fn mesh_from_snapshot(job: &MeshJob) -> ChunkMesh {
     let c = &job.center;
     let (ox, oz) = c.pos.world_offset();
@@ -650,7 +683,6 @@ impl ChunkGenPool {
 impl Drop for ChunkGenPool {
     fn drop(&mut self) {
         self.shutdown.store(true, std::sync::atomic::Ordering::Release);
-        // Workers exit on disconnect or shutdown flag
     }
 }
 
@@ -685,7 +717,6 @@ impl MeshPool {
         Self { tx: req_tx, rx: res_rx, in_flight: HashMap::new(), _workers: workers, shutdown }
     }
 
-    /// Snapshot chunk + 8 neighbors and submit to worker. ~0.05ms per call.
     pub fn submit(&mut self, pos: ChunkPos, chunks: &HashMap<ChunkPos, Chunk>) {
         if self.in_flight.contains_key(&pos) { return; }
         let center = match chunks.get(&pos) { Some(c) => ChunkSnapshot::from_chunk(c), None => return };
@@ -794,7 +825,6 @@ impl World {
         }
     }
 
-    /// Blocking startup generation.
     pub fn generate_around_immediate(&mut self, px: f32, pz: f32) {
         let cx = (px / CHUNK_X as f32).floor() as i32;
         let cz = (pz / CHUNK_Z as f32).floor() as i32;
@@ -816,15 +846,12 @@ impl World {
         self.remove_far_chunks(cx, cz);
     }
 
-    /// Per-frame async generation + mesh dispatch.
-    /// Budget target: <2ms on main thread.
     pub fn generate_around(&mut self, px: f32, pz: f32) {
         let cx = (px / CHUNK_X as f32).floor() as i32;
         let cz = (pz / CHUNK_Z as f32).floor() as i32;
 
         let ta = std::time::Instant::now();
 
-        // Drain completed generations (cheap: just channel recv + hashmap insert)
         for chunk in self.gen_pool.drain() {
             let pos = chunk.pos;
             self.chunks.insert(pos, chunk);
@@ -835,7 +862,6 @@ impl World {
 
         let tb = std::time::Instant::now();
 
-        // Submit generation requests (spiral) — cap at MAX_CHUNKS_PER_FRAME * 2
         let mut req = 0;
         'outer: for dist in 0..=GENERATION_DISTANCE { for dz in -dist..=dist { for dx in -dist..=dist {
             if dx.abs() != dist && dz.abs() != dist { continue; }
@@ -849,7 +875,6 @@ impl World {
 
         let tc = std::time::Instant::now();
 
-        // Propagate light — only 2 chunks/frame max (each can be expensive)
         let mut light_count = 0;
         let light_dirty: Vec<ChunkPos> = self.chunks.iter()
             .filter(|(_,c)| c.light_dirty).map(|(p,_)| *p).take(2).collect();
@@ -862,17 +887,14 @@ impl World {
 
         let td = std::time::Instant::now();
 
-        // Submit mesh jobs — cap at 4 snapshots/frame (each = 9 × 65KB clone)
         self.submit_mesh_jobs(cx, cz);
 
         let te = std::time::Instant::now();
 
-        // Heightmap prefetch: only 1 chunk per frame to avoid mutex storm
         self.hm_prefetch_step(cx, cz);
 
         let tf = std::time::Instant::now();
 
-        // Cleanup: only every 30 frames to amortize retain() cost
         self.cleanup_counter += 1;
         if self.cleanup_counter >= 30 {
             self.cleanup_counter = 0;
@@ -882,7 +904,6 @@ impl World {
 
         let tg = std::time::Instant::now();
 
-        // Print sub-timings (remove after profiling)
         let drain = (tb-ta).as_secs_f64()*1000.0;
         let genreq = (tc-tb).as_secs_f64()*1000.0;
         let light = (td-tc).as_secs_f64()*1000.0;
@@ -896,9 +917,7 @@ impl World {
         }
     }
 
-    /// Incremental heightmap prefetch: 1 chunk per frame around the prefetch ring.
     fn hm_prefetch_step(&mut self, cx: i32, cz: i32) {
-        // Walk one step of the ring each frame
         let ring_size = HM_PREFETCH * 2 + 1;
         let total = ring_size * ring_size;
         for _ in 0..1 {
@@ -906,7 +925,6 @@ impl World {
             self.hm_prefetch_idx += 1;
             let dx = (idx % ring_size) - HM_PREFETCH;
             let dz = (idx / ring_size) - HM_PREFETCH;
-            // Only prefetch the outer ring (beyond GENERATION_DISTANCE)
             if dx.abs() > GENERATION_DISTANCE || dz.abs() > GENERATION_DISTANCE {
                 self.heightmap.precompute_chunk(
                     ChunkPos::new(cx + dx, cz + dz), &self.noise, &self.tree_noise);
@@ -931,7 +949,6 @@ impl World {
         }
     }
 
-    /// Drain completed meshes. Call from main loop, then upload to GPU.
     pub fn drain_completed_meshes(&mut self) -> Vec<ChunkMesh> {
         self.mesh_pool.drain()
     }

@@ -139,10 +139,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|hit| format!("{:?}", hit.block_type))
                 .unwrap_or_else(|| "---".to_string());
 
-            let n = t_frames.max(1) as f64;
-            println!("  events={:.1}ms update={:.1}ms world={:.1}ms upload={:.1}ms unload={:.1}ms render={:.1}ms",
-                t_events/n*1000.0, t_update/n*1000.0, t_world/n*1000.0,
-                t_upload/n*1000.0, t_unload/n*1000.0, t_render/n*1000.0);
+            // let n = t_frames.max(1) as f64;
+            // println!("  events={:.1}ms update={:.1}ms world={:.1}ms upload={:.1}ms unload={:.1}ms render={:.1}ms",
+            //     t_events/n*1000.0, t_update/n*1000.0, t_world/n*1000.0,
+            //     t_upload/n*1000.0, t_unload/n*1000.0, t_render/n*1000.0);
             t_events = 0.0; t_update = 0.0; t_world = 0.0;
             t_upload = 0.0; t_unload = 0.0; t_render = 0.0; t_frames = 0;
 
