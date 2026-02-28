@@ -65,10 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|p| (p.x - player_cx).abs() <= RENDER_DISTANCE && (p.z - player_cz).abs() <= RENDER_DISTANCE)
         .copied().collect();
     for pos in &chunk_positions {
-        if let Some(chunk) = world.chunks.get(pos) {
-            let neighbors = world.get_neighbors(*pos);
-            let mesh = mesh_chunk(chunk, &neighbors);
-            renderer.upload_chunk_mesh(&device_ctx, *pos, &mesh)?;
+        if world.has_all_neighbors(*pos) {
+            if let Some(chunk) = world.chunks.get(pos) {
+                let neighbors = world.get_neighbors(*pos);
+                let mesh = mesh_chunk(chunk, &neighbors);
+                renderer.upload_chunk_mesh(&device_ctx, *pos, &mesh)?;
+            }
         }
     }
     // Mark only meshed chunks as clean (buffer ring stays dirty until it enters view)
@@ -90,7 +92,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_fps = 0;
 
     let mut input = PlayerInput::default();
-    let mut meshes_per_frame = 6; // Limit mesh rebuilds per frame
 
     println!("\n═══════════════════════════════════");
     println!("  Controls:");
@@ -197,7 +198,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         match mouse_btn {
                             MouseButton::Left => {
-                                // Break block
                                 if let Some(hit) = world.raycast(eye, dir, 6.0) {
                                     world.set_block(
                                         hit.block_pos[0], hit.block_pos[1], hit.block_pos[2],
@@ -206,7 +206,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             MouseButton::Right => {
-                                // Place block
                                 if let Some(hit) = world.raycast(eye, dir, 6.0) {
                                     world.set_block(
                                         hit.place_pos[0], hit.place_pos[1], hit.place_pos[2],
@@ -236,56 +235,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Update player
         player.update(dt, &input, &world);
 
-        // Generate new chunks around player
+        // === Async world update ===
+        // generate_around() now:
+        //   1. Drains completed chunk generations from background threads
+        //   2. Submits new gen requests (spiral priority)
+        //   3. Propagates light for edited chunks
+        //   4. Submits dirty chunks for background meshing (snapshot + send to workers)
+        //   5. Prefetches heightmaps ahead of player
         world.generate_around(player.position[0], player.position[2]);
 
-        // Propagate light for dirty chunks before meshing (limited to avoid stalls)
-        let light_dirty: Vec<ChunkPos> = world.chunks.iter()
-            .filter(|(_, c)| c.light_dirty)
-            .map(|(p, _)| *p)
-            .take(6)
-            .collect();
-        for pos in light_dirty {
-            if let Some(chunk) = world.chunks.get_mut(&pos) {
-                chunk.propagate_light();
-            }
-        }
-
-        // Only mesh dirty chunks within RENDER_DISTANCE that have all neighbors
-        // (buffer ring chunks stay unmeshed — they exist only so visible chunks
-        // have correct AO data at their boundaries)
-        let pcx = (player.position[0] / CHUNK_X as f32).floor() as i32;
-        let pcz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
-
-        let mut rebuilt = 0;
-        let mut dirty_chunks: Vec<ChunkPos> = world.chunks.iter()
-            .filter(|(p, c)| c.dirty
-                && (p.x - pcx).abs() <= RENDER_DISTANCE
-                && (p.z - pcz).abs() <= RENDER_DISTANCE)
-            .map(|(p, _)| *p)
-            .collect();
-        dirty_chunks.sort_by_key(|p| {
-            let dx = p.x - pcx;
-            let dz = p.z - pcz;
-            dx * dx + dz * dz
-        });
-
-        for pos in dirty_chunks {
-            if rebuilt >= meshes_per_frame { break; }
-            // Only mesh if all 8 neighbors exist — prevents AO seams
-            if !world.has_all_neighbors(pos) { continue; }
-            if let Some(chunk) = world.chunks.get(&pos) {
-                let neighbors = world.get_neighbors(pos);
-                let mesh = mesh_chunk(chunk, &neighbors);
-                renderer.upload_chunk_mesh(&device_ctx, pos, &mesh)?;
-            }
-            if let Some(chunk) = world.chunks.get_mut(&pos) {
-                chunk.dirty = false;
-            }
-            rebuilt += 1;
+        // === Drain completed meshes from background workers and upload to GPU ===
+        // This is the ONLY meshing-related work on the main thread.
+        // Each upload: ~0.1-0.2ms (vkCreateBuffer + memcpy). Typically 2-4 per frame.
+        let completed_meshes = world.drain_completed_meshes();
+        for mesh in &completed_meshes {
+            renderer.upload_chunk_mesh(&device_ctx, mesh.pos, mesh)?;
         }
 
         // Remove GPU data for chunks that left render distance
+        let pcx = (player.position[0] / CHUNK_X as f32).floor() as i32;
+        let pcz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
         let gpu_chunks: Vec<ChunkPos> = renderer.loaded_chunk_positions();
         for pos in gpu_chunks {
             if (pos.x - pcx).abs() > RENDER_DISTANCE + 1
