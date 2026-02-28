@@ -902,19 +902,19 @@ impl World {
             self.heightmap.evict_far(cx, cz, HM_PREFETCH + 2);
         }
 
-        let tg = std::time::Instant::now();
+        // let tg = std::time::Instant::now();
 
-        let drain = (tb-ta).as_secs_f64()*1000.0;
-        let genreq = (tc-tb).as_secs_f64()*1000.0;
-        let light = (td-tc).as_secs_f64()*1000.0;
-        let mesh = (te-td).as_secs_f64()*1000.0;
-        let hmpre = (tf-te).as_secs_f64()*1000.0;
-        let clean = (tg-tf).as_secs_f64()*1000.0;
-        let total = (tg-ta).as_secs_f64()*1000.0;
-        if total > 2.0 {
-            println!("    [world] drain={:.1} genreq={:.1} light={:.1} mesh={:.1} hmpre={:.1} clean={:.1} TOTAL={:.1}ms (lit={})",
-                drain, genreq, light, mesh, hmpre, clean, total, light_count);
-        }
+        // let drain = (tb-ta).as_secs_f64()*1000.0;
+        // let genreq = (tc-tb).as_secs_f64()*1000.0;
+        // let light = (td-tc).as_secs_f64()*1000.0;
+        // let mesh = (te-td).as_secs_f64()*1000.0;
+        // let hmpre = (tf-te).as_secs_f64()*1000.0;
+        // let clean = (tg-tf).as_secs_f64()*1000.0;
+        // let total = (tg-ta).as_secs_f64()*1000.0;
+        // if total > 2.0 {
+        //     println!("    [world] drain={:.1} genreq={:.1} light={:.1} mesh={:.1} hmpre={:.1} clean={:.1} TOTAL={:.1}ms (lit={})",
+        //         drain, genreq, light, mesh, hmpre, clean, total, light_count);
+        // }
     }
 
     fn hm_prefetch_step(&mut self, cx: i32, cz: i32) {
