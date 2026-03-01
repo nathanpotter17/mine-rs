@@ -638,6 +638,15 @@ impl Renderer {
 
             // === Pass 3: Crosshair overlay ===
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.crosshair_pipeline);
+            let aspect = device_ctx.swapchain_extent.width as f32
+                       / device_ctx.swapchain_extent.height as f32;
+            self.device.cmd_push_constants(
+                cmd,
+                self.crosshair_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                std::slice::from_raw_parts(&aspect as *const f32 as *const u8, std::mem::size_of::<f32>()),
+            );
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.crosshair_vertex_buffer], &[0]);
             self.device.cmd_draw(cmd, 12, 1, 0, 0);
 
@@ -921,7 +930,16 @@ impl Renderer {
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dyn_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
 
-            let layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .offset(0)
+                .size(std::mem::size_of::<f32>() as u32);
+
+            let layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .push_constant_ranges(std::slice::from_ref(&push_range)),
+                None,
+            )?;
 
             let pi = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages).vertex_input_state(&vi).input_assembly_state(&ia)

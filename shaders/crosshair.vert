@@ -2,6 +2,12 @@
 
 layout(location = 0) in vec2 inPos;
 
+layout(push_constant) uniform PushData {
+    float aspect_ratio; // width / height
+} pc;
+
 void main() {
-    gl_Position = vec4(inPos, 0.0, 1.0);
+    vec2 pos = inPos;
+    pos.x /= pc.aspect_ratio;
+    gl_Position = vec4(pos, 0.0, 1.0);
 }
