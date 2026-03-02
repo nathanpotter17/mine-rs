@@ -1,13 +1,9 @@
-// ===== net.rs — LAN Multiplayer Networking =====
-//
 // Architecture: Listen-server with server-authoritative world.
 //   - Server thread owns tick loop at fixed 20 Hz
 //   - TCP: reliable ordered (block changes, chunk data, join/leave)
 //   - UDP: unreliable fast (player positions/rotations)
 //   - Clients send inputs → server simulates → broadcasts state
 //
-// Integration: add `pub mod net;` to lib.rs (after `pub mod ui;`)
-// File location: src/net.rs
 
 use std::{
     collections::HashMap,
@@ -52,6 +48,7 @@ pub enum NetEvent {
     AssignedId { id: PlayerId },
     Disconnected { reason: String },
     WorldSeed { seed: u32 },
+    TimeSync { game_time: f32 },
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +56,7 @@ pub enum NetCommand {
     SendPlayerState { position: [f32; 3], yaw: f32, pitch: f32, on_ground: bool },
     RequestBlockChange { wx: i32, wy: i32, wz: i32, block: BlockType },
     RequestChunk { pos: ChunkPos },
+    SendTimeSync { game_time: f32 },
     Disconnect,
 }
 
@@ -76,6 +74,7 @@ pub enum PacketType {
     ChunkResponse  = 0x07,
     Disconnect     = 0x08,
     PlayerPosition = 0x10,
+    TimeSync      = 0x11,
 }
 
 impl PacketType {
@@ -90,6 +89,7 @@ impl PacketType {
             0x07 => Some(Self::ChunkResponse),
             0x08 => Some(Self::Disconnect),
             0x10 => Some(Self::PlayerPosition),
+            0x11 => Some(Self::TimeSync),
             _ => None,
         }
     }
@@ -184,6 +184,21 @@ fn decode_position_udp(buf: &[u8]) -> Option<(PlayerId, [f32;3], f32, f32, bool)
     let yaw = f32::from_le_bytes(buf[14..18].try_into().ok()?);
     let pitch = f32::from_le_bytes(buf[18..22].try_into().ok()?);
     Some((id, [x,y,z], yaw, pitch, buf[22] != 0))
+}
+
+// ===== UDP TimeSync Packet (5 bytes) =====
+// [u8 type=0x11][f32 game_time]
+
+fn encode_time_sync_udp(game_time: f32) -> [u8; 5] {
+    let mut buf = [0u8; 5];
+    buf[0] = PacketType::TimeSync as u8;
+    buf[1..5].copy_from_slice(&game_time.to_le_bytes());
+    buf
+}
+
+fn decode_time_sync_udp(buf: &[u8]) -> Option<f32> {
+    if buf.len() < 5 || buf[0] != PacketType::TimeSync as u8 { return None; }
+    Some(f32::from_le_bytes(buf[1..5].try_into().ok()?))
 }
 
 // ===== TCP Block Change Packet (13 bytes) =====
@@ -306,6 +321,7 @@ pub struct Server {
     clients: HashMap<PlayerId, ServerClient>,
     next_id: PlayerId,
     seed: u32,
+    game_time: f32,
     shutdown: Arc<AtomicBool>,
     _threads: Vec<thread::JoinHandle<()>>,
     tcp_incoming_tx: Sender<(PlayerId, PacketType, Vec<u8>)>,
@@ -351,6 +367,7 @@ impl Server {
         let mut server = Server {
             cmd_rx, event_tx, tcp_listener, udp_socket,
             clients: HashMap::new(), next_id: 1, seed,
+            game_time: 0.30, // default morning, host will overwrite immediately
             shutdown: shutdown.clone(),
             _threads: vec![accept_handle],
             tcp_incoming_tx: tcp_inc_tx, tcp_incoming_rx: tcp_inc_rx,
@@ -371,6 +388,7 @@ impl Server {
             self.process_udp_incoming();
             self.process_host_commands();
             self.broadcast_player_states();
+            self.broadcast_time_sync();
             let elapsed = tick.elapsed();
             if elapsed < TICK_DURATION { thread::sleep(TICK_DURATION - elapsed); }
         }
@@ -400,9 +418,10 @@ impl Server {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1).max(1);
 
-            let mut ack = Vec::with_capacity(5);
+            let mut ack = Vec::with_capacity(9);
             write_u8(&mut ack, id);
             write_u32(&mut ack, self.seed);
+            write_f32(&mut ack, self.game_time);
             if tcp_send(&mut stream, PacketType::HandshakeAck, &ack).is_err() {
                 let _ = stream.shutdown(Shutdown::Both); continue;
             }
@@ -517,6 +536,9 @@ impl Server {
                         let pkt = encode_block_change(wx, wy, wz, block);
                         for c in self.clients.values_mut() { let _ = tcp_send(&mut c.tcp_stream, PacketType::BlockChange, &pkt); }
                     }
+                    NetCommand::SendTimeSync { game_time } => {
+                        self.game_time = game_time;
+                    }
                     NetCommand::Disconnect => { self.shutdown.store(true, Ordering::Release); }
                     _ => {}
                 },
@@ -535,6 +557,15 @@ impl Server {
             let _ = self.event_tx.send(NetEvent::PlayerState {
                 id: s.id, position: s.position, yaw: s.yaw, pitch: s.pitch, on_ground: s.on_ground,
             });
+        }
+    }
+
+    fn broadcast_time_sync(&self) {
+        let pkt = encode_time_sync_udp(self.game_time);
+        for c in self.clients.values() {
+            if let Some(a) = c.udp_addr {
+                let _ = self.udp_socket.send_to(&pkt, a);
+            }
         }
     }
 
@@ -584,10 +615,12 @@ impl Client {
         let mut off = 0;
         let my_id = read_u8(&ack, &mut off);
         let seed = read_u32(&ack, &mut off);
-        println!("[client] Connected id={} seed={}", my_id, seed);
+        let initial_time = if ack.len() >= 9 { read_f32(&ack, &mut off) } else { 0.30 };
+        println!("[client] Connected id={} seed={} time={:.3}", my_id, seed, initial_time);
 
         let _ = event_tx.send(NetEvent::AssignedId { id: my_id });
         let _ = event_tx.send(NetEvent::WorldSeed { seed });
+        let _ = event_tx.send(NetEvent::TimeSync { game_time: initial_time });
 
         let udp = UdpSocket::bind("0.0.0.0:0")?;
         let server_udp: SocketAddr = format!("{}:{}", server_ip, udp_port)
@@ -618,7 +651,12 @@ impl Client {
             while !us.load(Ordering::Relaxed) {
                 match ur.recv_from(&mut buf) {
                     Ok((len, _)) => {
-                        if let Some((id,pos,yaw,pitch,og)) = decode_position_udp(&buf[..len]) {
+                        let data = &buf[..len];
+                        if len >= 5 && data[0] == PacketType::TimeSync as u8 {
+                            if let Some(gt) = decode_time_sync_udp(data) {
+                                let _ = ue.send(NetEvent::TimeSync { game_time: gt });
+                            }
+                        } else if let Some((id,pos,yaw,pitch,og)) = decode_position_udp(data) {
                             let _ = ue.send(NetEvent::PlayerState { id, position: pos, yaw, pitch, on_ground: og });
                         }
                     }
@@ -727,6 +765,10 @@ impl NetworkHandle {
 
     pub fn request_block_change(&self, wx: i32, wy: i32, wz: i32, block: BlockType) {
         self.send(NetCommand::RequestBlockChange { wx, wy, wz, block });
+    }
+
+    pub fn send_time_sync(&self, game_time: f32) {
+        self.send(NetCommand::SendTimeSync { game_time });
     }
 
     pub fn is_online(&self) -> bool { !matches!(self, Self::Offline) }

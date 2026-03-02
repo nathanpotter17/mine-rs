@@ -356,7 +356,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let dt = now.duration_since(last_frame).as_secs_f32().min(0.1);
         last_frame = now;
-        game_time = (game_time + dt / day_length_seconds) % 1.0;
+        // Host and offline: advance time locally. Clients receive from server.
+        if !network.is_online() || network.is_host() {
+            game_time = (game_time + dt / day_length_seconds) % 1.0;
+        }
+
+        // Host: push authoritative time to server thread for broadcast to clients
+        if network.is_host() {
+            network.send_time_sync(game_time);
+        }
 
         // FPS counter
         frame_count += 1;
@@ -616,6 +624,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                NetEvent::TimeSync { game_time: server_time } => {
+                    // Client: adopt server's authoritative game time
+                    if !network.is_host() {
+                        game_time = server_time;
+                    }
+                }
             }
         }
 
@@ -684,11 +698,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ]
         }).collect();
         renderer.set_remote_players(&remote_transforms);
-
-        // Always show player models when multiplayer is active
-        if network.is_online() && !remote_players.is_empty() {
-            renderer.player_model_visible = true;
-        }
 
         // ===== Render =====
         t_unload += t0.elapsed().as_secs_f64();

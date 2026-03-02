@@ -834,29 +834,36 @@ impl Renderer {
                 self.device.cmd_draw_indexed(cmd, data.index_count, 1, 0, 0, 0);
             }
 
-            // === Pass 2.5: Player model (third-person only) ===
-            if self.player_model_visible && self.player_model_index_count > 0 {
+            // === Pass 2.5: Player models ===
+            // Local player: only in third-person (player_model_visible).
+            // Remote players: always rendered when present, independent of local camera.
+            let has_any_player_model = (self.player_model_visible || !self.remote_player_matrices.is_empty())
+                && self.player_model_index_count > 0;
+            if has_any_player_model {
                 self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.player_model_pipeline);
                 self.device.cmd_bind_descriptor_sets(
                     cmd, vk::PipelineBindPoint::GRAPHICS,
                     self.player_model_pipeline_layout, 0,
                     &[self.descriptor_sets[self.current_frame]], &[],
                 );
-                // Push model matrix (64 bytes)
-                let model_bytes: &[u8] = std::slice::from_raw_parts(
-                    self.player_model_matrix.as_ptr() as *const u8,
-                    64,
-                );
-                self.device.cmd_push_constants(
-                    cmd, self.player_model_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0, model_bytes,
-                );
                 self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.player_model_vertex_buffer], &[0]);
                 self.device.cmd_bind_index_buffer(cmd, self.player_model_index_buffer, 0, vk::IndexType::UINT32);
-                self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
 
-                // === Remote players ===
+                // --- Local player (third-person only) ---
+                if self.player_model_visible {
+                    let model_bytes: &[u8] = std::slice::from_raw_parts(
+                        self.player_model_matrix.as_ptr() as *const u8,
+                        64,
+                    );
+                    self.device.cmd_push_constants(
+                        cmd, self.player_model_pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0, model_bytes,
+                    );
+                    self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
+                }
+
+                // --- Remote players (always) ---
                 for matrix in &self.remote_player_matrices {
                     let model_bytes: &[u8] = std::slice::from_raw_parts(
                         matrix.as_ptr() as *const u8,
