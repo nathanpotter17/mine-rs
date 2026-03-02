@@ -7,7 +7,7 @@ use std::time::Instant;
 use simmerlib::{
     device::{DeviceContext, WINDOW_NAME},
     world::{World, BlockType, CHUNK_X, CHUNK_Z, RENDER_DISTANCE, GENERATION_DISTANCE, mesh_chunk, ChunkPos},
-    player::{Player, PlayerInput},
+    player::{Player, PlayerInput, CameraMode},
     renderer::{Renderer, ViewUBO, Frustum},
     ui::{UIManager, UIElement, Button},
 };
@@ -174,6 +174,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spawn_z = 8.0;
     let mut player = Player::new(spawn_x, 80.0, spawn_z);
 
+    // Generate player model mesh and upload to GPU
+    {
+        let (verts, idxs) = player.generate_player_mesh();
+        renderer.init_player_model(&device_ctx, &verts, &idxs)?;
+        // flush_uploads called below after chunk mesh uploads
+    }
+    println!("✓ Player model uploaded ({} verts)", 24);
+
     // Generate initial chunks
     print!("  Generating terrain...");
     world.generate_around_immediate(player.position[0], player.position[2]);
@@ -203,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    // Flush all initial staging uploads to DEVICE_LOCAL
+    // Flush all initial staging uploads to DEVICE_LOCAL (includes player model + chunks)
     renderer.flush_uploads(&device_ctx)?;
     // Mark only meshed chunks as clean (buffer ring stays dirty until it enters view)
     for pos in &chunk_positions {
@@ -249,6 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Space      - Jump / Fly up");
     println!("  LShift     - Fly down");
     println!("  F          - Toggle flying");
+    println!("  V          - Toggle 1st/3rd person cam");
     println!("  U          - Toggle UI menu");
     println!("  LClick     - Break block");
     println!("  RClick     - Place block");
@@ -285,9 +294,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let time_hours = (game_time * 24.0) as u32;
             let time_mins = ((game_time * 24.0 - time_hours as f32) * 60.0) as u32;
             let ui_tag = if renderer.ui_manager.visible { " | [UI]" } else { "" };
+            let cam_tag = match player.camera_mode {
+                CameraMode::FirstPerson => "FP",
+                CameraMode::ThirdPerson => "TP",
+            };
             window.set_title(&format!(
-                "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | Chunks: {} | {:02}:{:02} | Place: {:?}{}",
-                last_fps, pos[0], pos[1], pos[2], mode,
+                "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | {} | Chunks: {} | {:02}:{:02} | Place: {:?}{}",
+                last_fps, pos[0], pos[1], pos[2], mode, cam_tag,
                 renderer.chunk_count(), time_hours, time_mins, player.selected_block, ui_tag,
             )).ok();
         }
@@ -307,6 +320,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     Keycode::U => {
                         toggle_ui(&mut renderer.ui_manager, &sdl.mouse(), &mut mouse_captured);
+                    }
+
+                    // Toggle camera mode (first/third person)
+                    Keycode::V if !ui_visible => {
+                        player.toggle_camera_mode();
                     }
 
                     Keycode::Escape => {
@@ -503,21 +521,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Render
+        // ===== Render =====
         t_unload += t0.elapsed().as_secs_f64();
         let t0 = Instant::now();
         let aspect = device_ctx.swapchain_extent.width as f32 / device_ctx.swapchain_extent.height as f32;
-        let eye = player.eye_position();
 
-        let view = player.get_view_matrix();
+        // Camera: use current mode (first-person or third-person)
+        let view = player.current_view_matrix();
         let proj = player.get_projection_matrix(aspect);
+        let cam_pos = player.camera_position();
         let frustum = Frustum::from_view_proj(&view, &proj);
 
         let ubo = ViewUBO {
             view,
             proj,
-            camera_pos: [eye[0], eye[1], eye[2], 0.0],
+            camera_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 0.0],
         };
+
+        // Update player model state on renderer
+        let is_third_person = player.camera_mode == CameraMode::ThirdPerson;
+        renderer.player_model_visible = is_third_person;
+        renderer.player_model_matrix = player.get_model_matrix();
 
         renderer.render(&device_ctx, ubo, &frustum, game_time)?;
         t_render += t0.elapsed().as_secs_f64();

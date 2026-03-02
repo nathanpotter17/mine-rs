@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::device::DeviceContext;
 use crate::world::{BlockVertex, ChunkMesh, ChunkPos};
 use crate::ui::{UIManager, UIOverlay};
+use crate::player::PlayerVertex;
 
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -163,6 +164,17 @@ pub struct Renderer {
     // Staging upload batch
     pending_copies: Vec<StagingCopy>,
     upload_fence: vk::Fence,
+
+    // Player model (third-person view)
+    player_model_pipeline: vk::Pipeline,
+    player_model_pipeline_layout: vk::PipelineLayout,
+    player_model_vertex_buffer: vk::Buffer,
+    player_model_vertex_memory: vk::DeviceMemory,
+    player_model_index_buffer: vk::Buffer,
+    player_model_index_memory: vk::DeviceMemory,
+    player_model_index_count: u32,
+    pub player_model_visible: bool,
+    pub player_model_matrix: [[f32; 4]; 4],
 }
 
 const MAX_FRAMES: usize = 2;
@@ -226,6 +238,10 @@ impl Renderer {
             Self::create_sky_pipeline(&device, render_pass, descriptor_set_layout)?;
         println!("  ✓ Sky pipeline created");
 
+        let (player_model_pipeline, player_model_pipeline_layout) =
+            Self::create_player_model_pipeline(&device, render_pass, descriptor_set_layout)?;
+        println!("  ✓ Player model pipeline created");
+
         let upload_fence = unsafe {
             device.create_fence(&vk::FenceCreateInfo::default(), None)?
         };
@@ -250,7 +266,167 @@ impl Renderer {
             frame_counter: 0,
             pending_copies: Vec::new(),
             upload_fence,
+            player_model_pipeline,
+            player_model_pipeline_layout,
+            // Placeholder handles — overwritten by create_player_model_buffers() in main
+            player_model_vertex_buffer: vk::Buffer::null(),
+            player_model_vertex_memory: vk::DeviceMemory::null(),
+            player_model_index_buffer: vk::Buffer::null(),
+            player_model_index_memory: vk::DeviceMemory::null(),
+            player_model_index_count: 0,
+            player_model_visible: false,
+            player_model_matrix: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
         })
+    }
+
+    /// Initialize player model GPU buffers. Call once after Renderer::new().
+    /// Must call flush_uploads() after this to execute the staging copies.
+    pub fn init_player_model(
+        &mut self,
+        device_ctx: &DeviceContext,
+        vertices: &[PlayerVertex],
+        indices: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.create_player_model_buffers(device_ctx, vertices, indices)
+    }
+
+    fn create_player_model_pipeline(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        desc_layout: vk::DescriptorSetLayout,
+    ) -> Result<(vk::Pipeline, vk::PipelineLayout), Box<dyn std::error::Error>> {
+        unsafe {
+            let vert_code = align_spv(include_bytes!("../shaders/compiled/player.vert.spv"));
+            let frag_code = align_spv(include_bytes!("../shaders/compiled/player.frag.spv"));
+            let vert_mod = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&vert_code), None)?;
+            let frag_mod = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&frag_code), None)?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX).module(vert_mod).name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_mod).name(c"main"),
+            ];
+
+            // PlayerVertex: position(vec3) + color(vec3) + normal(vec3) = 36 bytes
+            let binding = vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(std::mem::size_of::<PlayerVertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX);
+
+            let attrs = [
+                // location 0: position (R32G32B32_SFLOAT, offset 0)
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0).location(0)
+                    .format(vk::Format::R32G32B32_SFLOAT)
+                    .offset(0),
+                // location 1: color (R32G32B32_SFLOAT, offset 12)
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0).location(1)
+                    .format(vk::Format::R32G32B32_SFLOAT)
+                    .offset(12),
+                // location 2: normal (R32G32B32_SFLOAT, offset 24)
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0).location(2)
+                    .format(vk::Format::R32G32B32_SFLOAT)
+                    .offset(24),
+            ];
+
+            let vi = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(std::slice::from_ref(&binding))
+                .vertex_attribute_descriptions(&attrs);
+
+            let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let vp = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1).scissor_count(1);
+            let rs = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL).line_width(1.0)
+                .cull_mode(vk::CullModeFlags::BACK)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+            let ms = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+            // Depth test + write enabled — player model occludes/is occluded by terrain
+            let ds = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS);
+
+            let cba = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false);
+            let cb = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&cba));
+            let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dyn_state = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dyn_states);
+
+            // Push constant: mat4 model = 64 bytes (vertex stage only)
+            let push_range = vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .offset(0)
+                .size(64); // sizeof(mat4)
+
+            // Shares descriptor set layout with block pipeline (binding 0 = ViewUBO)
+            let layout = device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(std::slice::from_ref(&desc_layout))
+                    .push_constant_ranges(std::slice::from_ref(&push_range)), None)?;
+
+            let pi = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vi)
+                .input_assembly_state(&ia)
+                .viewport_state(&vp)
+                .rasterization_state(&rs)
+                .multisample_state(&ms)
+                .depth_stencil_state(&ds)
+                .color_blend_state(&cb)
+                .dynamic_state(&dyn_state)
+                .layout(layout)
+                .render_pass(render_pass)
+                .subpass(0);
+
+            let pipelines = device.create_graphics_pipelines(
+                vk::PipelineCache::null(), &[pi], None)
+                .map_err(|(_, e)| e)?;
+
+            device.destroy_shader_module(vert_mod, None);
+            device.destroy_shader_module(frag_mod, None);
+
+            Ok((pipelines[0], layout))
+        }
+    }
+
+    fn create_player_model_buffers(
+        &mut self,
+        device_ctx: &DeviceContext,
+        vertices: &[PlayerVertex],
+        indices: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let vert_size = (std::mem::size_of::<PlayerVertex>() * vertices.len()) as u64;
+        let idx_size = (std::mem::size_of::<u32>() * indices.len()) as u64;
+
+        let (vb, vm) = self.stage_buffer_upload(
+            device_ctx, vertices, vert_size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let (ib, im) = self.stage_buffer_upload(
+            device_ctx, indices, idx_size, vk::BufferUsageFlags::INDEX_BUFFER)?;
+
+        self.player_model_vertex_buffer = vb;
+        self.player_model_vertex_memory = vm;
+        self.player_model_index_buffer = ib;
+        self.player_model_index_memory = im;
+        self.player_model_index_count = indices.len() as u32;
+
+        Ok(())
     }
 
     // ===== Texture Atlas Generation =====
@@ -646,19 +822,44 @@ impl Renderer {
                 self.device.cmd_draw_indexed(cmd, data.index_count, 1, 0, 0, 0);
             }
 
-            // === Pass 3: Crosshair overlay ===
-            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.crosshair_pipeline);
-            let aspect = device_ctx.swapchain_extent.width as f32
-                       / device_ctx.swapchain_extent.height as f32;
-            self.device.cmd_push_constants(
-                cmd,
-                self.crosshair_pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                std::slice::from_raw_parts(&aspect as *const f32 as *const u8, std::mem::size_of::<f32>()),
-            );
-            self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.crosshair_vertex_buffer], &[0]);
-            self.device.cmd_draw(cmd, 12, 1, 0, 0);
+            // === Pass 2.5: Player model (third-person only) ===
+            if self.player_model_visible && self.player_model_index_count > 0 {
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.player_model_pipeline);
+                self.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.player_model_pipeline_layout, 0,
+                    &[self.descriptor_sets[self.current_frame]], &[],
+                );
+                // Push model matrix (64 bytes)
+                let model_bytes: &[u8] = std::slice::from_raw_parts(
+                    self.player_model_matrix.as_ptr() as *const u8,
+                    64,
+                );
+                self.device.cmd_push_constants(
+                    cmd, self.player_model_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0, model_bytes,
+                );
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.player_model_vertex_buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, self.player_model_index_buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
+            }
+
+            // === Pass 3: Crosshair overlay (first-person only) ===
+            if !self.player_model_visible {
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.crosshair_pipeline);
+                let aspect = device_ctx.swapchain_extent.width as f32
+                           / device_ctx.swapchain_extent.height as f32;
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.crosshair_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    std::slice::from_raw_parts(&aspect as *const f32 as *const u8, std::mem::size_of::<f32>()),
+                );
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.crosshair_vertex_buffer], &[0]);
+                self.device.cmd_draw(cmd, 12, 1, 0, 0);
+            }
 
             // / === Pass 4: UI overlay ===
             self.ui_overlay.update_and_render(cmd, &mut self.ui_manager);
@@ -1166,6 +1367,16 @@ impl Drop for Renderer {
             // Crosshair vertex buffer
             self.device.destroy_buffer(self.crosshair_vertex_buffer, None);
             self.device.free_memory(self.crosshair_vertex_memory, None);
+
+            // Player model
+            self.device.destroy_pipeline(self.player_model_pipeline, None);
+            self.device.destroy_pipeline_layout(self.player_model_pipeline_layout, None);
+            if self.player_model_vertex_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.player_model_vertex_buffer, None);
+                self.device.free_memory(self.player_model_vertex_memory, None);
+                self.device.destroy_buffer(self.player_model_index_buffer, None);
+                self.device.free_memory(self.player_model_index_memory, None);
+            }
 
             // Texture atlas
             self.device.destroy_sampler(self.atlas_sampler, None);

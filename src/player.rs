@@ -1,5 +1,24 @@
 use crate::world::{World, BlockType, CHUNK_Y};
 
+// ===== Camera Mode =====
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CameraMode {
+    FirstPerson,
+    ThirdPerson,
+}
+
+// ===== Player Model Vertex =====
+// 36-byte vertex for the player model box (position + color + normal)
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PlayerVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub normal: [f32; 3],
+}
+
 pub struct Player {
     pub position: [f32; 3],
     pub velocity: [f32; 3],
@@ -20,6 +39,11 @@ pub struct Player {
     pub width: f32,
     pub height: f32,
     pub eye_height: f32,
+
+    // Camera
+    pub camera_mode: CameraMode,
+    pub third_person_distance: f32,
+    pub third_person_height: f32,
 }
 
 impl Player {
@@ -40,6 +64,9 @@ impl Player {
             width: 0.6,
             height: 1.8,
             eye_height: 1.62,
+            camera_mode: CameraMode::FirstPerson,
+            third_person_distance: 5.0,
+            third_person_height: 1.5,
         }
     }
 
@@ -211,6 +238,9 @@ impl Player {
         false
     }
 
+    // ===== Camera Matrix Methods =====
+
+    /// First-person view matrix (existing behavior)
     pub fn get_view_matrix(&self) -> [[f32; 4]; 4] {
         let eye = self.eye_position();
         let dir = self.forward();
@@ -225,6 +255,123 @@ impl Player {
         let near = 0.1;
         let far = 500.0;
         perspective(fov, aspect, near, far)
+    }
+
+    /// Third-person camera position: behind and above the player along the look direction.
+    /// Returns (camera_pos, look_target) pair.
+    pub fn get_third_person_camera(&self) -> ([f32; 3], [f32; 3]) {
+        let eye = self.eye_position();
+        let fwd = self.forward();
+
+        let cam_pos = [
+            eye[0] - fwd[0] * self.third_person_distance,
+            eye[1] - fwd[1] * self.third_person_distance + self.third_person_height,
+            eye[2] - fwd[2] * self.third_person_distance,
+        ];
+
+        (cam_pos, eye)
+    }
+
+    /// Third-person view matrix: camera orbits behind player.
+    pub fn get_third_person_view_matrix(&self) -> [[f32; 4]; 4] {
+        let (cam_pos, target) = self.get_third_person_camera();
+        look_at(cam_pos, target, [0.0, 1.0, 0.0])
+    }
+
+    /// Returns the camera position for the current mode (used for ViewUBO.camera_pos).
+    pub fn camera_position(&self) -> [f32; 3] {
+        match self.camera_mode {
+            CameraMode::FirstPerson => self.eye_position(),
+            CameraMode::ThirdPerson => self.get_third_person_camera().0,
+        }
+    }
+
+    /// Returns the view matrix for the current camera mode.
+    pub fn current_view_matrix(&self) -> [[f32; 4]; 4] {
+        match self.camera_mode {
+            CameraMode::FirstPerson => self.get_view_matrix(),
+            CameraMode::ThirdPerson => self.get_third_person_view_matrix(),
+        }
+    }
+
+    // ===== Player Model =====
+
+    /// Model matrix: translates to player.position and rotates by yaw around Y.
+    /// The mesh is defined with feet at origin, so translation places feet at position.
+    pub fn get_model_matrix(&self) -> [[f32; 4]; 4] {
+        let c = self.yaw.cos();
+        let s = self.yaw.sin();
+        let p = self.position;
+        // Column-major: rotation around Y then translate
+        [
+            [ c,   0.0, -s,  0.0],
+            [ 0.0, 1.0,  0.0, 0.0],
+            [ s,   0.0,  c,  0.0],
+            [p[0], p[1], p[2], 1.0],
+        ]
+    }
+
+    pub fn toggle_camera_mode(&mut self) {
+        self.camera_mode = match self.camera_mode {
+            CameraMode::FirstPerson => CameraMode::ThirdPerson,
+            CameraMode::ThirdPerson => CameraMode::FirstPerson,
+        };
+    }
+
+    /// Generate a static player model mesh: a box matching player dimensions.
+    /// Feet at origin (0,0,0), top at (0, height, 0).
+    /// Returns (vertices, indices).
+    pub fn generate_player_mesh(&self) -> (Vec<PlayerVertex>, Vec<u32>) {
+        let hw = self.width / 2.0;   // half-width  (X)
+        let hd = self.width / 2.0;   // half-depth  (Z), same as width for square cross-section
+        let h  = self.height;         // full height (Y)
+
+        // 8 corner positions: bottom 4 (y=0), top 4 (y=h)
+        let p = [
+            [-hw, 0.0, -hd], // 0: bottom-left-back
+            [ hw, 0.0, -hd], // 1: bottom-right-back
+            [ hw, 0.0,  hd], // 2: bottom-right-front
+            [-hw, 0.0,  hd], // 3: bottom-left-front
+            [-hw,   h, -hd], // 4: top-left-back
+            [ hw,   h, -hd], // 5: top-right-back
+            [ hw,   h,  hd], // 6: top-right-front
+            [-hw,   h,  hd], // 7: top-left-front
+        ];
+
+        // Face definitions: (corner_indices, normal, color)
+        // Colors: teal body with subtle per-face variation for visual clarity
+        let faces: [([usize; 4], [f32; 3], [f32; 3]); 6] = [
+            // Front (+Z): teal
+            ([3, 2, 6, 7], [ 0.0,  0.0,  1.0], [0.22, 0.62, 0.72]),
+            // Back (-Z): darker teal
+            ([1, 0, 4, 5], [ 0.0,  0.0, -1.0], [0.18, 0.50, 0.58]),
+            // Top (+Y): lighter / head area
+            ([7, 6, 5, 4], [ 0.0,  1.0,  0.0], [0.75, 0.60, 0.48]),
+            // Bottom (-Y): dark
+            ([0, 1, 2, 3], [ 0.0, -1.0,  0.0], [0.20, 0.20, 0.25]),
+            // Right (+X): medium teal
+            ([2, 1, 5, 6], [ 1.0,  0.0,  0.0], [0.20, 0.55, 0.65]),
+            // Left (-X): medium teal
+            ([0, 3, 7, 4], [-1.0,  0.0,  0.0], [0.20, 0.55, 0.65]),
+        ];
+
+        let mut vertices = Vec::with_capacity(24);
+        let mut indices = Vec::with_capacity(36);
+
+        for (corners, normal, color) in &faces {
+            let base = vertices.len() as u32;
+            for &ci in corners {
+                vertices.push(PlayerVertex {
+                    position: p[ci],
+                    color: *color,
+                    normal: *normal,
+                });
+            }
+            // Two triangles per face: 0-1-2, 2-3-0
+            indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+        }
+
+        (vertices, indices)
     }
 
     /// Cycle through available block types

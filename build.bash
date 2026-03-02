@@ -19,6 +19,8 @@ shaders=(
     "sky.frag:sky.frag.spv"
     "ui.vert:ui.vert.spv"
     "ui.frag:ui.frag.spv"
+    "player.vert:player.vert.spv"
+    "player.frag:player.frag.spv"
 )
 
 compile_shaders() {
