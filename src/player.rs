@@ -44,6 +44,9 @@ pub struct Player {
     pub camera_mode: CameraMode,
     pub third_person_distance: f32,
     pub third_person_height: f32,
+
+    // Net
+    pub player_id: u8,
 }
 
 impl Player {
@@ -67,6 +70,7 @@ impl Player {
             camera_mode: CameraMode::FirstPerson,
             third_person_distance: 5.0,
             third_person_height: 1.5,
+            player_id: 0, // 0 = local/host, assigned by server for clients
         }
     }
 

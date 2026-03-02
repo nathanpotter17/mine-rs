@@ -3,3 +3,4 @@ pub mod world;
 pub mod player;
 pub mod renderer;
 pub mod ui;
+pub mod net;

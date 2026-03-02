@@ -10,7 +10,9 @@ use simmerlib::{
     player::{Player, PlayerInput, CameraMode},
     renderer::{Renderer, ViewUBO, Frustum},
     ui::{UIManager, UIOverlay, UIElement, Button},
+    net::{NetworkHandle, NetEvent, NetCommand, RemotePlayer, PlayerId},
 };
+use std::collections::HashMap as StdHashMap;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -159,10 +161,35 @@ fn toggle_ui(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n╔════════════════════════════════════╗");
-    println!("║      VOXEL WORLD - Minecraft       ║");
-    println!("║        Vulkan Renderer              ║");
-    println!("╚════════════════════════════════════╝\n");
+    println!("Minecraft");
+
+    // Parse CLI: --host | --connect <ip> [--name <name>]
+    let args: Vec<String> = std::env::args().collect();
+    let mut net_mode = "offline";
+    let mut connect_ip = String::new();
+    let mut player_name = "Player".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => { net_mode = "host"; }
+            "--connect" => {
+                net_mode = "client";
+                if i + 1 < args.len() {
+                    connect_ip = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--name" => {
+                if i + 1 < args.len() {
+                    player_name = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 
     // SDL2
     let sdl = sdl2::init()?;
@@ -179,9 +206,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Renderer initialized");
 
     // World
-    let seed = 42;
+    let seed: u32 = 42;  // or from CLI: --seed <n>
     let mut world = World::new(seed);
     println!("✓ World created (seed: {})", seed);
+
+    let network = match net_mode {
+        "host" => {
+            println!("Starting as HOST (seed={})", seed);
+            match NetworkHandle::host(seed) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to start server: {}", e);
+                    NetworkHandle::Offline
+                }
+            }
+        }
+        "client" => {
+            println!("Connecting to {}...", connect_ip);
+            match NetworkHandle::connect(&connect_ip, &player_name) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to connect: {}", e);
+                    NetworkHandle::Offline
+                }
+            }
+        }
+        _ => NetworkHandle::Offline,
+    };
+
+    // Track remote players for rendering
+    let mut remote_players: StdHashMap<PlayerId, RemotePlayer> = StdHashMap::new();
 
     // Player - spawn above terrain
     let spawn_x = 8.0;
@@ -278,6 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut t_frames = 0u32;
 
     println!("\n═══════════════════════════════════");
+    println!("  --host         Host a multiplayer game");
+    println!("  --connect <ip> Connect to a host");
+    println!("  --name <name>  Set player name");
     println!("  Controls:");
     println!("  WASD       - Move");
     println!("  Mouse      - Look");
@@ -442,18 +499,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match mouse_btn {
                             MouseButton::Left => {
                                 if let Some(hit) = world.raycast(eye, dir, 6.0) {
-                                    world.set_block(
-                                        hit.block_pos[0], hit.block_pos[1], hit.block_pos[2],
-                                        BlockType::Air,
-                                    );
+                                    let (bx, by, bz) = (hit.block_pos[0], hit.block_pos[1], hit.block_pos[2]);
+                                    // Apply locally immediately (client prediction)
+                                    world.set_block(bx, by, bz, BlockType::Air);
+                                    // Notify network
+                                    if network.is_online() {
+                                        network.request_block_change(bx, by, bz, BlockType::Air);
+                                    }
                                 }
                             }
                             MouseButton::Right => {
                                 if let Some(hit) = world.raycast(eye, dir, 6.0) {
-                                    world.set_block(
-                                        hit.place_pos[0], hit.place_pos[1], hit.place_pos[2],
-                                        player.selected_block,
-                                    );
+                                    let (px, py, pz) = (hit.place_pos[0], hit.place_pos[1], hit.place_pos[2]);
+                                    world.set_block(px, py, pz, player.selected_block);
+                                    if network.is_online() {
+                                        network.request_block_change(px, py, pz, player.selected_block);
+                                    }
                                 }
                             }
                             _ => {}
@@ -508,6 +569,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // ===== Network events =====
+        for event in network.drain_events() {
+            match event {
+                NetEvent::PlayerJoined { id, name } => {
+                    println!("[net] Player '{}' joined (id={})", name, id);
+                    remote_players.insert(id, RemotePlayer::new(id, name));
+                }
+                NetEvent::PlayerLeft { id } => {
+                    println!("[net] Player {} left", id);
+                    remote_players.remove(&id);
+                }
+                NetEvent::PlayerState { id, position, yaw, pitch, on_ground } => {
+                    if let Some(rp) = remote_players.get_mut(&id) {
+                        // Smooth interpolation toward the server snapshot
+                        rp.interpolate_toward(position, yaw, 0.3);
+                        rp.pitch = pitch;
+                        rp.on_ground = on_ground;
+                        rp.last_update = Instant::now();
+                    }
+                }
+                NetEvent::BlockChange { wx, wy, wz, block } => {
+                    // Apply block change from network (another player placed/broke a block)
+                    world.set_block(wx, wy, wz, block);
+                }
+                NetEvent::AssignedId { id } => {
+                    player.player_id = id;
+                    println!("[net] Assigned player id={}", id);
+                }
+                NetEvent::WorldSeed { seed: server_seed } => {
+                    // Client: regenerate world with server's seed
+                    println!("[net] Using server seed={}", server_seed);
+                    world = World::new(server_seed);
+                    world.generate_around_immediate(player.position[0], player.position[2]);
+                }
+                NetEvent::Disconnected { reason } => {
+                    eprintln!("[net] Disconnected: {}", reason);
+                    // Could fall back to offline mode or show UI
+                }
+                NetEvent::ChunkData { pos, blocks } => {
+                    // Server sent modified chunk data — apply it
+                    if !blocks.is_empty() {
+                        if let Some(chunk) = world.chunks.get_mut(&pos) {
+                            chunk.set_blocks_from_raw(&blocks);
+                            chunk.propagate_light();
+                        }
+                    }
+                }
+            }
+        }
+
         // ===== Update player =====
         t_events += t0.elapsed().as_secs_f64();
         let t0 = Instant::now();
@@ -515,6 +626,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Only update player physics when UI is closed
         if !renderer.ui_manager.visible {
             player.update(dt, &input, &world);
+        }
+
+        // Send our position to the network (every frame is fine for LAN;
+        // for internet you'd throttle to ~20Hz)
+        if network.is_online() {
+            network.send_player_state(
+                player.position,
+                player.yaw,
+                player.pitch,
+                player.on_ground,
+            );
         }
 
         // === Async world update ===
@@ -549,6 +671,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Build remote player transforms for rendering
+        let remote_transforms: Vec<[[f32; 4]; 4]> = remote_players.values().map(|rp| {
+            let c = rp.yaw.cos();
+            let s = rp.yaw.sin();
+            let p = rp.position;
+            [
+                [ c,   0.0, -s,  0.0],
+                [ 0.0, 1.0,  0.0, 0.0],
+                [ s,   0.0,  c,  0.0],
+                [p[0], p[1], p[2], 1.0],
+            ]
+        }).collect();
+        renderer.set_remote_players(&remote_transforms);
+
+        // Always show player models when multiplayer is active
+        if network.is_online() && !remote_players.is_empty() {
+            renderer.player_model_visible = true;
+        }
+
         // ===== Render =====
         t_unload += t0.elapsed().as_secs_f64();
         let t0 = Instant::now();
@@ -576,6 +717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nShutting down...");
+    network.disconnect();
     unsafe { device_ctx.device.device_wait_idle()?; }
     Ok(())
 }

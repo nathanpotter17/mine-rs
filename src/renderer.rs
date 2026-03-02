@@ -175,6 +175,7 @@ pub struct Renderer {
     player_model_index_count: u32,
     pub player_model_visible: bool,
     pub player_model_matrix: [[f32; 4]; 4],
+    pub remote_player_matrices: Vec<[[f32; 4]; 4]>,
 }
 
 const MAX_FRAMES: usize = 2;
@@ -285,7 +286,14 @@ impl Renderer {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
+            remote_player_matrices: Vec::new(),
         })
+    }
+
+    /// Store remote player transforms for rendering this frame.
+    /// Call before render_frame().
+    pub fn set_remote_players(&mut self, transforms: &[[[f32; 4]; 4]]) {
+        self.remote_player_matrices = transforms.to_vec();
     }
 
     /// Initialize player model GPU buffers. Call once after Renderer::new().
@@ -847,6 +855,20 @@ impl Renderer {
                 self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.player_model_vertex_buffer], &[0]);
                 self.device.cmd_bind_index_buffer(cmd, self.player_model_index_buffer, 0, vk::IndexType::UINT32);
                 self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
+
+                // === Remote players ===
+                for matrix in &self.remote_player_matrices {
+                    let model_bytes: &[u8] = std::slice::from_raw_parts(
+                        matrix.as_ptr() as *const u8,
+                        64,
+                    );
+                    self.device.cmd_push_constants(
+                        cmd, self.player_model_pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0, model_bytes,
+                    );
+                    self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
+                }
             }
 
             // === Pass 3: Crosshair overlay (first-person only) ===

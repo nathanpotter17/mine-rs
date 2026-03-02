@@ -26,6 +26,14 @@ impl BlockType {
     pub fn is_light_source(self) -> bool { matches!(self, BlockType::Torch) }
     pub fn light_level(self) -> u8 { match self { BlockType::Torch => 15, _ => 0 } }
 
+    pub fn from_u8(v: u8) -> Option<Self> {
+        if v <= Self::Torch as u8 {  // last variant
+            Some(unsafe { std::mem::transmute(v) })
+        } else {
+            None
+        }
+    }
+
     /// Tile index into the 16×16 texture atlas.
     /// Row 0 (tiles 0-15)  = top faces
     /// Row 1 (tiles 16-31) = side faces
@@ -206,6 +214,33 @@ impl Chunk {
             }
         }
         self.light_dirty = false;
+    }
+
+    /// Raw block slice for network serialization (used by net.rs RLE encoder)
+    pub fn blocks_raw(&self) -> &[BlockType] {
+        &self.blocks
+    }
+
+    /// Overwrite all blocks from network data. Marks chunk dirty.
+    pub fn set_blocks_from_raw(&mut self, blocks: &[BlockType]) {
+        if blocks.len() == CHUNK_X * CHUNK_Y * CHUNK_Z {
+            self.blocks.copy_from_slice(blocks);
+            self.dirty = true;
+            self.light_dirty = true;
+            // Recompute Y bounds
+            self.min_y = CHUNK_Y;
+            self.max_y = 0;
+            for y in 0..CHUNK_Y {
+                for z in 0..CHUNK_Z {
+                    for x in 0..CHUNK_X {
+                        if self.get(x, y, z) != BlockType::Air {
+                            if y < self.min_y { self.min_y = y; }
+                            if y > self.max_y { self.max_y = y; }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
