@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 ash = { version = "0.38", features = ["linked"] }
 sdl2 = { version = "0.37", features = ["bundled", "raw-window-handle"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 crossbeam = "0.8.4"
 parking_lot = "0.12.4"
 bytemuck = "1.23.2"

@@ -1,35 +1,46 @@
 use ash::{vk, Device};
+use std::collections::HashMap;
 use std::sync::Arc;
 use crate::device::DeviceContext;
 
 // ===== Constants =====
 
-/// Maximum UI elements per frame. 128 quads × 6 verts × 24 bytes = 18,432 bytes.
+/// Maximum UI elements per frame. 128 quads × 6 verts × 32 bytes = 24,576 bytes.
 const MAX_UI_ELEMENTS: usize = 128;
 const VERTS_PER_QUAD: usize = 6;
 const MAX_VERTICES: usize = MAX_UI_ELEMENTS * VERTS_PER_QUAD;
 
+/// Maximum number of UI textures that can be loaded simultaneously.
+/// Controls descriptor pool pre-allocation.
+const MAX_UI_TEXTURES: u32 = 32;
+
+/// Reserved texture ID for the built-in 1×1 white pixel.
+/// All color-only elements sample this so the shader path is always:
+///   outColor = texture(tex, uv) * vertexColor
+const WHITE_TEXTURE_ID: u32 = 0;
+
 // ===== Vertex Layout =====
 
 /// Per-vertex data written to the dynamic vertex buffer.
-/// Stride = 24 bytes. Matches pipeline vertex input:
-///   location 0: R32G32_SFLOAT   (pos,   offset 0)
-///   location 1: R32G32B32A32_SFLOAT (color, offset 8)
+/// Stride = 32 bytes. Matches pipeline vertex input:
+///   location 0: R32G32_SFLOAT       (pos,   offset 0)
+///   location 1: R32G32_SFLOAT       (uv,    offset 8)
+///   location 2: R32G32B32A32_SFLOAT (color, offset 16)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct UIVertex {
     pos: [f32; 2],   // clip-space position
-    color: [f32; 4], // RGBA
+    uv: [f32; 2],    // texture coordinates
+    color: [f32; 4], // RGBA tint / solid color
 }
 
 impl UIVertex {
-    const STRIDE: u32 = std::mem::size_of::<Self>() as u32; // 24
+    const STRIDE: u32 = std::mem::size_of::<Self>() as u32; // 32
 }
 
 // ===== Coordinate Helpers =====
 
 /// Convert normalized screen coords (0-1, top-left origin) to Vulkan clip space.
-/// Standard viewport (y=0, height=+H): clip Y=-1 is screen top, Y=+1 is screen bottom.
 /// x: 0→-1, 1→+1
 /// y: 0→-1 (top), 1→+1 (bottom)
 #[inline]
@@ -39,27 +50,34 @@ fn screen_to_clip(sx: f32, sy: f32) -> [f32; 2] {
 
 /// Build 6 vertices (two triangles) for one axis-aligned quad.
 /// `x, y, w, h` in normalized screen coords. Color applied to all vertices.
-fn build_quad_vertices(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> [UIVertex; 6] {
+/// `uv_rect` = [u0, v0, u1, v1] defining the texture region.
+fn build_quad_vertices(
+    x: f32, y: f32, w: f32, h: f32,
+    color: [f32; 4],
+    uv_rect: [f32; 4],
+) -> [UIVertex; 6] {
     let tl = screen_to_clip(x, y);
     let tr = screen_to_clip(x + w, y);
     let bl = screen_to_clip(x, y + h);
     let br = screen_to_clip(x + w, y + h);
 
+    let [u0, v0, u1, v1] = uv_rect;
+
     [
         // Triangle 1: TL → TR → BR
-        UIVertex { pos: tl, color },
-        UIVertex { pos: tr, color },
-        UIVertex { pos: br, color },
+        UIVertex { pos: tl, uv: [u0, v0], color },
+        UIVertex { pos: tr, uv: [u1, v0], color },
+        UIVertex { pos: br, uv: [u1, v1], color },
         // Triangle 2: TL → BR → BL
-        UIVertex { pos: tl, color },
-        UIVertex { pos: br, color },
-        UIVertex { pos: bl, color },
+        UIVertex { pos: tl, uv: [u0, v0], color },
+        UIVertex { pos: br, uv: [u1, v1], color },
+        UIVertex { pos: bl, uv: [u0, v1], color },
     ]
 }
 
 // ===== UI Element =====
 
-/// A single colored rectangle in screen space.
+/// A single rectangle in screen space, optionally textured.
 #[derive(Copy, Clone, Debug)]
 pub struct UIElement {
     /// Position: (x, y) top-left corner in normalized screen coords [0..1]
@@ -68,15 +86,41 @@ pub struct UIElement {
     /// Size in normalized screen coords
     pub width: f32,
     pub height: f32,
-    /// RGBA color [0..1]
+    /// RGBA color [0..1]. For textured elements this acts as a tint/multiply.
     pub color: [f32; 4],
     /// Whether this element is visible
     pub visible: bool,
+    /// Texture ID to sample from. `WHITE_TEXTURE_ID` (0) = solid color only.
+    /// Obtain IDs from `UIOverlay::load_texture()`.
+    pub texture_id: u32,
+    /// UV rectangle [u0, v0, u1, v1] defining which region of the texture to sample.
+    /// Defaults to [0, 0, 1, 1] (full texture).
+    pub uv_rect: [f32; 4],
 }
 
 impl UIElement {
+    /// Create a solid-color element (no texture).
     pub fn new(x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) -> Self {
-        Self { x, y, width, height, color, visible: true }
+        Self {
+            x, y, width, height, color, visible: true,
+            texture_id: WHITE_TEXTURE_ID,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    /// Create a textured element.
+    /// `color` acts as a tint/multiply — use `[1,1,1,1]` for no tint.
+    pub fn new_textured(
+        x: f32, y: f32, width: f32, height: f32,
+        texture_id: u32,
+        uv_rect: [f32; 4],
+        color: [f32; 4],
+    ) -> Self {
+        Self {
+            x, y, width, height, color, visible: true,
+            texture_id,
+            uv_rect,
+        }
     }
 
     /// Check if a point (in normalized screen coords) is inside this element
@@ -169,6 +213,78 @@ impl Button {
         btn
     }
 
+    /// Create a textured button. State colors act as tint multipliers.
+    pub fn new_textured(
+        id: u32,
+        x: f32, y: f32, w: f32, h: f32,
+        texture_id: u32,
+        uv_rect: [f32; 4],
+        color: [f32; 4],
+    ) -> Self {
+        let hover = [
+            (color[0] * 1.15).min(1.0),
+            (color[1] * 1.15).min(1.0),
+            (color[2] * 1.15).min(1.0),
+            color[3],
+        ];
+        let pressed = [
+            color[0] * 0.80,
+            color[1] * 0.80,
+            color[2] * 0.80,
+            color[3],
+        ];
+        let disabled = [
+            color[0] * 0.5,
+            color[1] * 0.5,
+            color[2] * 0.5,
+            color[3] * 0.6,
+        ];
+
+        let mut btn = Self {
+            id,
+            element: UIElement::new_textured(x, y, w, h, texture_id, uv_rect, color),
+            state: ButtonState::Normal,
+            color_normal: color,
+            color_hover: hover,
+            color_pressed: pressed,
+            color_disabled: disabled,
+        };
+        btn.apply_state_color();
+        btn
+    }
+
+    /// Create a textured button that auto-fits to the image's aspect ratio.
+    /// The button fits inside `(max_w, max_h)` without stretching, centered
+    /// horizontally at `center_x`.
+    ///
+    /// # Example (main.rs)
+    /// ```ignore
+    /// let btn = Button::new_textured_fitted(
+    ///     &renderer.ui_overlay, &renderer.ui_manager,
+    ///     42,
+    ///     0.50, 0.45,          // center_x, y
+    ///     0.30, 0.08,          // max_w, max_h
+    ///     hud_text_id,
+    ///     [0.0, 0.75, 1.0, 1.0],
+    ///     [1.0, 1.0, 1.0, 1.0],
+    /// );
+    /// renderer.ui_manager.add_button(btn);
+    /// ```
+    pub fn new_textured_fitted(
+        overlay: &UIOverlay,
+        manager: &UIManager,
+        id: u32,
+        center_x: f32, y: f32,
+        max_w: f32, max_h: f32,
+        texture_id: u32,
+        uv_rect: [f32; 4],
+        color: [f32; 4],
+    ) -> Self {
+        let (w, h) = manager.fit_to_aspect(overlay, texture_id, max_w, max_h, &uv_rect);
+        let x = center_x - w / 2.0;
+        Self::new_textured(id, x, y, w, h, texture_id, uv_rect, color)
+    }
+
     #[inline]
     pub fn id(&self) -> u32 { self.id }
 
@@ -234,6 +350,9 @@ pub struct UIManager {
     pub dirty: bool,
     /// Master visibility toggle
     pub visible: bool,
+    /// Current screen aspect ratio (width / height). Updated via set_screen_size()
+    /// or automatically in update_mouse_position(). Used by fitted placement methods.
+    screen_aspect: f32,
 }
 
 impl Default for UIManager {
@@ -248,6 +367,7 @@ impl Default for UIManager {
             pressed_button_id: None,
             dirty: true,
             visible: false,
+            screen_aspect: 16.0 / 9.0, // sensible default, overwritten on first resize/input
         }
     }
 }
@@ -262,6 +382,114 @@ impl UIManager {
     pub fn add_element(&mut self, elem: UIElement) {
         self.elements.push(elem);
         self.dirty = true;
+    }
+
+    /// Convenience: add a textured quad (e.g. pre-rendered text image).
+    /// `color` = [1,1,1,1] for no tint, or use as alpha/tint multiplier.
+    pub fn add_textured_element(
+        &mut self,
+        x: f32, y: f32, width: f32, height: f32,
+        texture_id: u32,
+        uv_rect: [f32; 4],
+        color: [f32; 4],
+    ) {
+        self.elements.push(UIElement::new_textured(
+            x, y, width, height, texture_id, uv_rect, color,
+        ));
+        self.dirty = true;
+    }
+
+    /// Add a textured quad that preserves the image's native aspect ratio.
+    /// The quad is sized to fit inside `(max_w, max_h)` without stretching.
+    /// Position `(x, y)` is the top-left corner.
+    ///
+    /// Requires `overlay` to query the texture's pixel dimensions.
+    ///
+    /// # Example (main.rs)
+    /// ```ignore
+    /// renderer.ui_manager.add_textured_element_fitted(
+    ///     &renderer.ui_overlay,
+    ///     0.35, 0.29,                  // top-left position
+    ///     0.30, 0.08,                  // max bounding box
+    ///     hud_text_id,
+    ///     [0.0, 0.0, 1.0, 1.0],       // full texture
+    ///     [1.0, 1.0, 1.0, 1.0],       // no tint
+    /// );
+    /// ```
+    pub fn add_textured_element_fitted(
+        &mut self,
+        overlay: &UIOverlay,
+        x: f32, y: f32,
+        max_w: f32, max_h: f32,
+        texture_id: u32,
+        uv_rect: [f32; 4],
+        color: [f32; 4],
+    ) {
+        let (w, h) = self.fit_to_aspect(overlay, texture_id, max_w, max_h, &uv_rect);
+        self.elements.push(UIElement::new_textured(x, y, w, h, texture_id, uv_rect, color));
+        self.dirty = true;
+    }
+
+    /// Add a textured quad that preserves aspect ratio AND centers horizontally.
+    /// `center_x` = horizontal center position (0.5 = screen center).
+    /// `y` = top edge.
+    ///
+    /// # Example (main.rs)
+    /// ```ignore
+    /// renderer.ui_manager.add_textured_element_centered(
+    ///     &renderer.ui_overlay,
+    ///     0.50, 0.29,                  // center_x, top y
+    ///     0.30, 0.08,                  // max bounding box
+    ///     hud_text_id,
+    ///     [0.0, 0.0, 1.0, 1.0],
+    ///     [1.0, 1.0, 1.0, 1.0],
+    /// );
+    /// ```
+    pub fn add_textured_element_centered(
+        &mut self,
+        overlay: &UIOverlay,
+        center_x: f32, y: f32,
+        max_w: f32, max_h: f32,
+        texture_id: u32,
+        uv_rect: [f32; 4],
+        color: [f32; 4],
+    ) {
+        let (w, h) = self.fit_to_aspect(overlay, texture_id, max_w, max_h, &uv_rect);
+        let x = center_x - w / 2.0;
+        self.elements.push(UIElement::new_textured(x, y, w, h, texture_id, uv_rect, color));
+        self.dirty = true;
+    }
+
+    /// Compute aspect-ratio-preserving (width, height) in normalized screen coords.
+    /// Fits inside (max_w, max_h) without stretching, accounting for screen aspect ratio.
+    /// If uv_rect selects a sub-region, the sub-region's proportions are used.
+    fn fit_to_aspect(
+        &self,
+        overlay: &UIOverlay,
+        texture_id: u32,
+        max_w: f32,
+        max_h: f32,
+        uv_rect: &[f32; 4],
+    ) -> (f32, f32) {
+        let (tex_w, tex_h) = overlay.texture_size(texture_id).unwrap_or((1, 1));
+
+        // Account for UV sub-region: effective pixel dimensions
+        let region_w = (uv_rect[2] - uv_rect[0]).abs() * tex_w as f32;
+        let region_h = (uv_rect[3] - uv_rect[1]).abs() * tex_h as f32;
+
+        // Image aspect in pixel space, corrected for non-square screen
+        // In normalized coords, 0.1 horizontal ≠ 0.1 vertical unless screen is square.
+        // Dividing by screen_aspect converts pixel-space ratio to normalized-coord ratio.
+        let img_aspect = (region_w / region_h.max(1.0)) / self.screen_aspect;
+
+        let box_aspect = max_w / max_h.max(0.001);
+        if img_aspect > box_aspect {
+            // Width-limited
+            (max_w, max_w / img_aspect)
+        } else {
+            // Height-limited
+            (max_h * img_aspect, max_h)
+        }
     }
 
     pub fn clear_elements(&mut self) {
@@ -311,6 +539,22 @@ impl UIManager {
         self.dirty = true;
     }
 
+    // ── Screen geometry ──
+
+    /// Set screen dimensions. Call once at init and on resize.
+    /// Also called implicitly by update_mouse_position().
+    pub fn set_screen_size(&mut self, screen_w: f32, screen_h: f32) {
+        if screen_h > 0.0 {
+            self.screen_aspect = screen_w / screen_h;
+        }
+    }
+
+    /// Current screen aspect ratio (width / height).
+    #[inline]
+    pub fn screen_aspect(&self) -> f32 {
+        self.screen_aspect
+    }
+
     // ── Mouse input ──
 
     /// Update mouse position from raw screen pixel coordinates.
@@ -318,6 +562,9 @@ impl UIManager {
     pub fn update_mouse_position(&mut self, pixel_x: f32, pixel_y: f32, screen_w: f32, screen_h: f32) {
         self.mouse_x = (pixel_x / screen_w).clamp(0.0, 1.0);
         self.mouse_y = (pixel_y / screen_h).clamp(0.0, 1.0);
+        if screen_h > 0.0 {
+            self.screen_aspect = screen_w / screen_h;
+        }
     }
 
     /// Update mouse button state.
@@ -445,21 +692,77 @@ impl UIManager {
         out
     }
 
-    /// Build vertex data for all visible elements. Returns vertex count.
+    /// Build vertex data for all visible elements, batched by texture_id.
+    /// Returns Vec of (texture_id, start_vertex, vertex_count) draw batches.
     /// Writes into `dst` which must have capacity for MAX_VERTICES.
-    fn build_vertices(&self, dst: &mut Vec<UIVertex>) -> u32 {
+    fn build_vertices(&self, dst: &mut Vec<UIVertex>) -> Vec<DrawBatch> {
         dst.clear();
-        if !self.visible { return 0; }
+        if !self.visible { return Vec::new(); }
 
         let elements = self.collect_visible_elements();
         let count = elements.len().min(MAX_UI_ELEMENTS);
 
-        for elem in &elements[..count] {
-            let verts = build_quad_vertices(elem.x, elem.y, elem.width, elem.height, elem.color);
+        // Sort by texture_id to batch draws and minimize descriptor set swaps
+        let mut sorted: Vec<&UIElement> = elements[..count].iter().collect();
+        sorted.sort_by_key(|e| e.texture_id);
+
+        let mut batches: Vec<DrawBatch> = Vec::new();
+        let mut current_tex = u32::MAX;
+        let mut batch_start = 0u32;
+
+        for elem in &sorted {
+            if elem.texture_id != current_tex {
+                // Close previous batch
+                let current_vert = dst.len() as u32;
+                if current_vert > batch_start {
+                    batches.push(DrawBatch {
+                        texture_id: current_tex,
+                        start_vertex: batch_start,
+                        vertex_count: current_vert - batch_start,
+                    });
+                }
+                current_tex = elem.texture_id;
+                batch_start = current_vert;
+            }
+            let verts = build_quad_vertices(
+                elem.x, elem.y, elem.width, elem.height,
+                elem.color, elem.uv_rect,
+            );
             dst.extend_from_slice(&verts);
         }
-        dst.len() as u32
+
+        // Close final batch
+        let final_vert = dst.len() as u32;
+        if final_vert > batch_start {
+            batches.push(DrawBatch {
+                texture_id: current_tex,
+                start_vertex: batch_start,
+                vertex_count: final_vert - batch_start,
+            });
+        }
+
+        batches
     }
+}
+
+/// Describes one draw call within a frame: a range of vertices sharing one texture.
+#[derive(Copy, Clone, Debug)]
+struct DrawBatch {
+    texture_id: u32,
+    start_vertex: u32,
+    vertex_count: u32,
+}
+
+// ===== GPU Texture Resource =====
+
+/// All Vulkan resources for a single UI texture.
+struct UITextureGPU {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    descriptor_set: vk::DescriptorSet,
+    width: u32,
+    height: u32,
 }
 
 // ===== GPU Resources (UIOverlay) =====
@@ -479,9 +782,20 @@ pub struct UIOverlay {
     vertex_buffer: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
     vertex_mapped: *mut u8,  // persistently mapped
-    vertex_count: u32,
-    // Scratch buffer for building vertices (avoids per-frame allocation)
+
+    // Scratch buffers (avoids per-frame allocation)
     vertex_scratch: Vec<UIVertex>,
+    batch_scratch: Vec<DrawBatch>,
+
+    // Texture infrastructure
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    sampler: vk::Sampler,
+    textures: HashMap<u32, UITextureGPU>,
+    next_texture_id: u32,
+
+    // Cached for texture uploads
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
 }
 
 // SAFETY: vertex_mapped is a persistently-mapped GPU pointer used only on the
@@ -495,7 +809,7 @@ impl UIOverlay {
     /// Create the UI overlay pipeline and vertex buffer.
     /// Call after render_pass is created. Reuses the same render_pass as the crosshair.
     ///
-    /// # Renderer::new integration point (after crosshair creation, ~line 214):
+    /// # Renderer::new integration point (after crosshair creation, ~line 233):
     /// ```ignore
     /// let ui_overlay = UIOverlay::new(&device, &device_ctx, render_pass)?;
     /// println!("  ✓ UI overlay created");
@@ -507,25 +821,114 @@ impl UIOverlay {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Arc::clone(device);
 
-        let (pipeline, pipeline_layout) = Self::create_pipeline(&device, render_pass)?;
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device)?;
+        let descriptor_pool = Self::create_descriptor_pool(&device)?;
+        let sampler = Self::create_sampler(&device)?;
+
+        let (pipeline, pipeline_layout) =
+            Self::create_pipeline(&device, render_pass, descriptor_set_layout)?;
         let (vertex_buffer, vertex_memory, vertex_mapped) =
             Self::create_vertex_buffer(&device, device_ctx)?;
 
-        Ok(Self {
+        let mut overlay = Self {
             device,
             pipeline,
             pipeline_layout,
             vertex_buffer,
             vertex_memory,
             vertex_mapped,
-            vertex_count: 0,
             vertex_scratch: Vec::with_capacity(MAX_VERTICES),
-        })
+            batch_scratch: Vec::new(),
+            descriptor_set_layout,
+            descriptor_pool,
+            sampler,
+            textures: HashMap::new(),
+            next_texture_id: WHITE_TEXTURE_ID + 1, // 0 is reserved for white
+            memory_properties: device_ctx.memory_properties,
+        };
+
+        // Create the built-in 1×1 white pixel texture (ID 0).
+        // Every color-only element samples this: texture(white) × color = color.
+        overlay.create_white_texture(device_ctx)?;
+
+        Ok(overlay)
     }
+
+    // ===== Public Texture API =====
+
+    /// Load an image file (BMP, PNG, JPG, TGA, etc.) and upload it as a UI texture.
+    /// Returns a texture ID for use in `UIElement::new_textured()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let tex_id = renderer.ui_overlay.load_texture(&device_ctx, "assets/hud_text.png")?;
+    /// renderer.ui_manager.add_textured_element(
+    ///     0.3, 0.02, 0.4, 0.06,   // x, y, w, h (normalized screen)
+    ///     tex_id,
+    ///     [0.0, 0.0, 1.0, 1.0],   // full texture
+    ///     [1.0, 1.0, 1.0, 1.0],   // no tint
+    /// );
+    /// ```
+    pub fn load_texture(
+        &mut self,
+        device_ctx: &DeviceContext,
+        path: &str,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let (width, height, rgba_pixels) = load_image_rgba8(path)?;
+        let id = self.next_texture_id;
+        self.next_texture_id += 1;
+        self.upload_texture_rgba8(device_ctx, id, width, height, &rgba_pixels)?;
+        println!("  ✓ UI texture loaded: {} ({}×{}, id={})", path, width, height, id);
+        Ok(id)
+    }
+
+    /// Upload raw RGBA8 pixel data as a UI texture. Use when you generate pixels
+    /// in code (e.g. CPU-rasterized text, procedural icons).
+    /// Returns the assigned texture ID.
+    pub fn load_texture_from_rgba8(
+        &mut self,
+        device_ctx: &DeviceContext,
+        width: u32,
+        height: u32,
+        rgba_pixels: &[u8],
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        assert_eq!(rgba_pixels.len(), (width * height * 4) as usize,
+            "Pixel data length must equal width × height × 4");
+        let id = self.next_texture_id;
+        self.next_texture_id += 1;
+        self.upload_texture_rgba8(device_ctx, id, width, height, rgba_pixels)?;
+        Ok(id)
+    }
+
+    /// Destroy a previously loaded texture and free its GPU resources.
+    pub fn destroy_texture(&mut self, id: u32) {
+        if id == WHITE_TEXTURE_ID { return; } // never destroy the white pixel
+        if let Some(tex) = self.textures.remove(&id) {
+            unsafe {
+                let _ = self.device.device_wait_idle();
+                self.device.destroy_image_view(tex.view, None);
+                self.device.destroy_image(tex.image, None);
+                self.device.free_memory(tex.memory, None);
+                // descriptor_set freed when pool is destroyed/reset
+            }
+        }
+    }
+
+    /// Check whether a texture ID is currently loaded.
+    pub fn has_texture(&self, id: u32) -> bool {
+        self.textures.contains_key(&id)
+    }
+
+    /// Get the pixel dimensions of a loaded texture.
+    pub fn texture_size(&self, id: u32) -> Option<(u32, u32)> {
+        self.textures.get(&id).map(|t| (t.width, t.height))
+    }
+
+    // ===== Rendering =====
 
     /// Rebuild vertex buffer from UIManager state (only if dirty), then record draw commands.
     ///
-    /// # Renderer::render integration point (after crosshair draw, ~line 642):
+    /// # Renderer::render integration point (after crosshair draw, ~line 864):
     /// ```ignore
     /// // === Pass 4: UI overlay ===
     /// self.ui_overlay.update_and_render(cmd, &mut self.ui_manager);
@@ -539,11 +942,12 @@ impl UIOverlay {
 
         // Rebuild vertex data when dirty
         if manager.dirty {
-            self.vertex_count = manager.build_vertices(&mut self.vertex_scratch);
+            self.batch_scratch = manager.build_vertices(&mut self.vertex_scratch);
             manager.dirty = false;
 
-            if self.vertex_count > 0 {
-                let byte_count = self.vertex_count as usize * std::mem::size_of::<UIVertex>();
+            if !self.vertex_scratch.is_empty() {
+                let byte_count =
+                    self.vertex_scratch.len() * std::mem::size_of::<UIVertex>();
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         self.vertex_scratch.as_ptr() as *const u8,
@@ -554,32 +958,349 @@ impl UIOverlay {
             }
         }
 
-        if self.vertex_count == 0 { return; }
+        if self.batch_scratch.is_empty() { return; }
 
         unsafe {
-            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_pipeline(
+                cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline,
+            );
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
-            self.device.cmd_draw(cmd, self.vertex_count, 1, 0, 0);
+
+            for batch in &self.batch_scratch {
+                // Bind the descriptor set for this batch's texture
+                let tex_id = batch.texture_id;
+                let ds = match self.textures.get(&tex_id) {
+                    Some(tex) => tex.descriptor_set,
+                    None => {
+                        // Fallback to white pixel if texture was destroyed
+                        match self.textures.get(&WHITE_TEXTURE_ID) {
+                            Some(tex) => tex.descriptor_set,
+                            None => continue, // should never happen
+                        }
+                    }
+                };
+
+                self.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout, 0,
+                    &[ds], &[],
+                );
+
+                self.device.cmd_draw(
+                    cmd, batch.vertex_count, 1, batch.start_vertex, 0,
+                );
+            }
         }
     }
 
     /// Record draw commands only (vertex data must already be uploaded).
     /// Use when you need finer control over update vs render timing.
     pub fn render_only(&self, cmd: vk::CommandBuffer) {
-        if self.vertex_count == 0 { return; }
+        if self.batch_scratch.is_empty() { return; }
+
         unsafe {
-            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device.cmd_bind_pipeline(
+                cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline,
+            );
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.vertex_buffer], &[0]);
-            self.device.cmd_draw(cmd, self.vertex_count, 1, 0, 0);
+
+            for batch in &self.batch_scratch {
+                let tex_id = batch.texture_id;
+                let ds = self.textures.get(&tex_id)
+                    .or_else(|| self.textures.get(&WHITE_TEXTURE_ID))
+                    .map(|t| t.descriptor_set);
+                let Some(ds) = ds else { continue; };
+
+                self.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout, 0,
+                    &[ds], &[],
+                );
+
+                self.device.cmd_draw(
+                    cmd, batch.vertex_count, 1, batch.start_vertex, 0,
+                );
+            }
+        }
+    }
+
+    // ===== Internal: texture upload =====
+
+    /// Create the built-in 1×1 white pixel texture at ID 0.
+    fn create_white_texture(
+        &mut self,
+        device_ctx: &DeviceContext,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let white_pixel: [u8; 4] = [255, 255, 255, 255];
+        self.upload_texture_rgba8(device_ctx, WHITE_TEXTURE_ID, 1, 1, &white_pixel)
+    }
+
+    /// Core upload: creates DEVICE_LOCAL image, stages pixel data, transitions layout,
+    /// creates image view, allocates descriptor set, writes descriptor.
+    /// Mirrors Renderer::create_texture_atlas pattern.
+    fn upload_texture_rgba8(
+        &mut self,
+        device_ctx: &DeviceContext,
+        id: u32,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let image_size = (width * height * 4) as u64;
+
+        unsafe {
+            // --- Create DEVICE_LOCAL image ---
+            let image = self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_SRGB)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?;
+
+            let mem_req = self.device.get_image_memory_requirements(image);
+            let mem_type = find_mem_type(
+                self.memory_properties,
+                mem_req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            let memory = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(mem_req.size)
+                    .memory_type_index(mem_type),
+                None,
+            )?;
+            self.device.bind_image_memory(image, memory, 0)?;
+
+            // --- Create staging buffer + copy pixel data ---
+            let staging_buf = self.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(image_size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?;
+
+            let staging_req = self.device.get_buffer_memory_requirements(staging_buf);
+            let staging_mem_type = find_mem_type(
+                self.memory_properties,
+                staging_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let staging_mem = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(staging_req.size)
+                    .memory_type_index(staging_mem_type),
+                None,
+            )?;
+            self.device.bind_buffer_memory(staging_buf, staging_mem, 0)?;
+
+            let mapped = self.device.map_memory(
+                staging_mem, 0, image_size, vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(
+                pixels.as_ptr(),
+                mapped as *mut u8,
+                image_size as usize,
+            );
+            self.device.unmap_memory(staging_mem);
+
+            // --- One-shot command buffer: transitions + copy ---
+            let cmd = self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(device_ctx.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+
+            // Transition UNDEFINED → TRANSFER_DST_OPTIMAL
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    })],
+            );
+
+            // Copy buffer → image
+            self.device.cmd_copy_buffer_to_image(
+                cmd, staging_buf, image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0, base_array_layer: 0, layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width, height, depth: 1 })],
+            );
+
+            // Transition TRANSFER_DST → SHADER_READ_ONLY_OPTIMAL
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[], &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    })],
+            );
+
+            self.device.end_command_buffer(cmd)?;
+
+            let fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            self.device.queue_submit(
+                device_ctx.queue,
+                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))],
+                fence,
+            )?;
+            self.device.wait_for_fences(&[fence], true, u64::MAX)?;
+
+            // Cleanup staging
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(device_ctx.command_pool, &[cmd]);
+            self.device.destroy_buffer(staging_buf, None);
+            self.device.free_memory(staging_mem, None);
+
+            // --- Image view ---
+            let view = self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_SRGB)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    }),
+                None,
+            )?;
+
+            // --- Allocate + write descriptor set ---
+            let descriptor_set = self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(std::slice::from_ref(&self.descriptor_set_layout)),
+            )?[0];
+
+            let img_info = vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(view)
+                .sampler(self.sampler);
+
+            self.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&img_info))],
+                &[],
+            );
+
+            // Store
+            self.textures.insert(id, UITextureGPU {
+                image, memory, view, descriptor_set, width, height,
+            });
+        }
+
+        Ok(())
+    }
+
+    // ===== Internal: Vulkan resource creation =====
+
+    fn create_descriptor_set_layout(
+        device: &Device,
+    ) -> Result<vk::DescriptorSetLayout, Box<dyn std::error::Error>> {
+        let binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        unsafe {
+            Ok(device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(std::slice::from_ref(&binding)),
+                None,
+            )?)
+        }
+    }
+
+    fn create_descriptor_pool(
+        device: &Device,
+    ) -> Result<vk::DescriptorPool, Box<dyn std::error::Error>> {
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_UI_TEXTURES);
+
+        unsafe {
+            Ok(device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(std::slice::from_ref(&pool_size))
+                    .max_sets(MAX_UI_TEXTURES)
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+                None,
+            )?)
+        }
+    }
+
+    /// Shared sampler for all UI textures. LINEAR filtering for smooth text rendering.
+    fn create_sampler(device: &Device) -> Result<vk::Sampler, Box<dyn std::error::Error>> {
+        unsafe {
+            Ok(device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .max_anisotropy(1.0)
+                    .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK),
+                None,
+            )?)
         }
     }
 
     // ── Pipeline creation ──
-    // Mirrors create_crosshair_pipeline() in renderer.rs lines 877-940
 
     fn create_pipeline(
         device: &Device,
         render_pass: vk::RenderPass,
+        descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> Result<(vk::Pipeline, vk::PipelineLayout), Box<dyn std::error::Error>> {
         unsafe {
             let vert_code = align_spv(include_bytes!("../shaders/compiled/ui.vert.spv"));
@@ -597,7 +1318,7 @@ impl UIOverlay {
                     .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_mod).name(c"main"),
             ];
 
-            // Vertex input: pos (vec2) + color (vec4)
+            // Vertex input: pos (vec2) + uv (vec2) + color (vec4)
             let binding = vk::VertexInputBindingDescription::default()
                 .binding(0)
                 .stride(UIVertex::STRIDE)
@@ -609,11 +1330,16 @@ impl UIOverlay {
                     .binding(0).location(0)
                     .format(vk::Format::R32G32_SFLOAT)
                     .offset(0),
-                // location 1: color (R32G32B32A32_SFLOAT, offset 8)
+                // location 1: uv (R32G32_SFLOAT, offset 8)
                 vk::VertexInputAttributeDescription::default()
                     .binding(0).location(1)
-                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .format(vk::Format::R32G32_SFLOAT)
                     .offset(8),
+                // location 2: color (R32G32B32A32_SFLOAT, offset 16)
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0).location(2)
+                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .offset(16),
             ];
 
             let vi = vk::PipelineVertexInputStateCreateInfo::default()
@@ -648,7 +1374,7 @@ impl UIOverlay {
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_blend_op(vk::BlendOp::ADD)
                 .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .alpha_blend_op(vk::BlendOp::ADD);
 
             let cb = vk::PipelineColorBlendStateCreateInfo::default()
@@ -658,9 +1384,12 @@ impl UIOverlay {
             let dyn_state = vk::PipelineDynamicStateCreateInfo::default()
                 .dynamic_states(&dyn_states);
 
-            // Empty layout — no push constants, no descriptor sets
+            // Layout with one descriptor set (binding 0 = sampler)
             let layout = device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default(), None)?;
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(std::slice::from_ref(&descriptor_set_layout)),
+                None,
+            )?;
 
             let pi = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
@@ -688,8 +1417,6 @@ impl UIOverlay {
     }
 
     // ── Vertex buffer creation ──
-    // Mirrors create_crosshair_buffer() in renderer.rs lines 1016-1038
-    // but HOST_VISIBLE + persistently mapped for dynamic updates.
 
     fn create_vertex_buffer(
         device: &Device,
@@ -733,24 +1460,54 @@ impl UIOverlay {
     }
 }
 
-/// Cleanup GPU resources. Matches Renderer::drop pattern (renderer.rs lines 1108-1167).
+/// Cleanup GPU resources.
 impl Drop for UIOverlay {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            // Unmap happens implicitly on free_memory, but explicit unmap is cleaner
+
+            // Destroy all loaded textures (images, views, memory)
+            for (_, tex) in self.textures.drain() {
+                self.device.destroy_image_view(tex.view, None);
+                self.device.destroy_image(tex.image, None);
+                self.device.free_memory(tex.memory, None);
+            }
+
+            // Sampler + descriptors
+            self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
+            // Vertex buffer
             self.device.unmap_memory(self.vertex_memory);
             self.device.destroy_buffer(self.vertex_buffer, None);
             self.device.free_memory(self.vertex_memory, None);
+
+            // Pipeline
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }
 
+// ===== Image File Loading =====
+
+/// Load an image file and decode to RGBA8 pixels.
+/// Supports BMP, PNG, JPG, TGA, and other formats via the `image` crate.
+///
+/// Returns (width, height, rgba_pixel_data).
+pub fn load_image_rgba8(
+    path: &str,
+) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
+    let img = image::open(path)
+        .map_err(|e| format!("Failed to load image '{}': {}", path, e))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok((w, h, rgba.into_raw()))
+}
+
 // ===== Helpers =====
 // Duplicated from renderer.rs to keep ui.rs self-contained.
-// If you refactor these into a shared module, remove these.
 
 fn find_mem_type(
     props: vk::PhysicalDeviceMemoryProperties,
@@ -764,7 +1521,7 @@ fn find_mem_type(
             return Ok(i);
         }
     }
-    Err("No suitable memory type for UI vertex buffer".into())
+    Err("No suitable memory type for UI resource".into())
 }
 
 fn align_spv(code: &[u8]) -> Vec<u32> {

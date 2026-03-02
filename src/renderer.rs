@@ -231,7 +231,11 @@ impl Renderer {
             Self::create_crosshair_buffer(&device, device_ctx)?;
 
         let ui_overlay = UIOverlay::new(&device, &device_ctx, render_pass)?;
-        let ui_manager = UIManager::new();
+        let mut ui_manager = UIManager::new();
+        ui_manager.set_screen_size(
+            device_ctx.swapchain_extent.width as f32,
+            device_ctx.swapchain_extent.height as f32,
+        );
         println!("  ✓ UI overlay created");
 
         let (sky_pipeline, sky_pipeline_layout) =

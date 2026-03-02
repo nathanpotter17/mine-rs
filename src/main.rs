@@ -9,7 +9,7 @@ use simmerlib::{
     world::{World, BlockType, CHUNK_X, CHUNK_Z, RENDER_DISTANCE, GENERATION_DISTANCE, mesh_chunk, ChunkPos},
     player::{Player, PlayerInput, CameraMode},
     renderer::{Renderer, ViewUBO, Frustum},
-    ui::{UIManager, UIElement, Button},
+    ui::{UIManager, UIOverlay, UIElement, Button},
 };
 
 const WIDTH: u32 = 1280;
@@ -49,7 +49,14 @@ fn new_action_queue() -> ActionQueue {
 ///   - Full-screen dim overlay
 ///   - Dark centered panel
 ///   - Three stacked buttons: Resume (green), Toggle Fly (blue), Quit (red)
-fn setup_pause_menu(manager: &mut UIManager, actions: &ActionQueue) {
+// replace setup_pause_menu function signature (line 52)
+// replace setup_pause_menu function (lines 52-116)
+fn setup_pause_menu(
+    manager: &mut UIManager,
+    overlay: &UIOverlay,
+    actions: &ActionQueue,
+    hud_text_id: u32,
+) {
     manager.clear_elements();
     manager.clear_buttons();
 
@@ -71,8 +78,15 @@ fn setup_pause_menu(manager: &mut UIManager, actions: &ActionQueue) {
         [0.4, 0.6, 1.0, 0.9],
     ));
 
-    // --- Buttons ---
-    // Centered horizontally: x = (1.0 - 0.20) / 2 = 0.40
+    // Title text image — auto-fitted to image aspect ratio, centered
+    manager.add_textured_element_centered(
+        overlay,
+        0.50, 0.29,              // center_x, top y
+        0.28, 0.05,              // max bounding box
+        hud_text_id,
+        [0.0, 0.0, 1.0, 1.0],   // full image
+        [1.0, 1.0, 1.0, 1.0],   // no tint
+    );
 
     // Resume — green
     manager.add_button(Button::new(
@@ -111,7 +125,7 @@ fn setup_pause_menu(manager: &mut UIManager, actions: &ActionQueue) {
         a.lock().unwrap().push(UIAction::Quit);
     });
 
-    // Start hidden — user presses U to open
+    // Start hidden
     manager.visible = false;
 }
 
@@ -221,10 +235,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(" done");
 
-    // UI setup
+    // UI
     let ui_actions = new_action_queue();
-    setup_pause_menu(&mut renderer.ui_manager, &ui_actions);
+    let hud_text_id = renderer.ui_overlay.load_texture(
+        &device_ctx,
+        "assets/ui/cat.png",
+    )?;
+    setup_pause_menu(&mut renderer.ui_manager, &renderer.ui_overlay, &ui_actions, hud_text_id);
     println!("✓ UI system ready (press U to toggle)");
+    // Persistent HUD — always visible, auto-fitted to image aspect ratio
+    renderer.ui_manager.add_textured_element_fitted(
+        &renderer.ui_overlay,
+        0.01, 0.01,            // top-left corner
+        0.15, 0.08,            // max bounding box
+        hud_text_id,
+        [0.0, 0.0, 0.5, 0.25],  // top-left quarter of image
+        [1.0, 1.0, 1.0, 0.7],   // slightly transparent
+    );
 
     // Mouse capture
     sdl.mouse().set_relative_mouse_mode(true);
@@ -449,6 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Window { win_event: WindowEvent::Resized(w, h), .. } => {
                     device_ctx.recreate_swapchain(w as u32, h as u32);
                     renderer.recreate_framebuffers(&device_ctx)?;
+                    renderer.ui_manager.set_screen_size(w as f32, h as f32);
                 }
 
                 _ => {}
