@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::device::DeviceContext;
 use crate::world::{BlockVertex, ChunkMesh, ChunkPos};
+use crate::ui::{UIManager, UIOverlay};
 
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -148,6 +149,10 @@ pub struct Renderer {
     sky_pipeline: vk::Pipeline,
     sky_pipeline_layout: vk::PipelineLayout,
 
+    // UI overlay
+    pub ui_overlay: UIOverlay,
+    pub ui_manager: UIManager,
+
     // Cached
     memory_properties: vk::PhysicalDeviceMemoryProperties,
 
@@ -213,6 +218,10 @@ impl Renderer {
         let (crosshair_vertex_buffer, crosshair_vertex_memory) =
             Self::create_crosshair_buffer(&device, device_ctx)?;
 
+        let ui_overlay = UIOverlay::new(&device, &device_ctx, render_pass)?;
+        let ui_manager = UIManager::new();
+        println!("  ✓ UI overlay created");
+
         let (sky_pipeline, sky_pipeline_layout) =
             Self::create_sky_pipeline(&device, render_pass, descriptor_set_layout)?;
         println!("  ✓ Sky pipeline created");
@@ -235,6 +244,7 @@ impl Renderer {
             crosshair_pipeline, crosshair_pipeline_layout,
             crosshair_vertex_buffer, crosshair_vertex_memory,
             sky_pipeline, sky_pipeline_layout,
+            ui_manager, ui_overlay,
             memory_properties: device_ctx.memory_properties,
             deletion_queue: Vec::new(),
             frame_counter: 0,
@@ -649,6 +659,9 @@ impl Renderer {
             );
             self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.crosshair_vertex_buffer], &[0]);
             self.device.cmd_draw(cmd, 12, 1, 0, 0);
+
+            // / === Pass 4: UI overlay ===
+            self.ui_overlay.update_and_render(cmd, &mut self.ui_manager);
 
             self.device.cmd_end_render_pass(cmd);
             self.device.end_command_buffer(cmd)?;
