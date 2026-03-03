@@ -51,8 +51,6 @@ fn new_action_queue() -> ActionQueue {
 ///   - Full-screen dim overlay
 ///   - Dark centered panel
 ///   - Three stacked buttons: Resume (green), Toggle Fly (blue), Quit (red)
-// replace setup_pause_menu function signature (line 52)
-// replace setup_pause_menu function (lines 52-116)
 fn setup_pause_menu(
     manager: &mut UIManager,
     overlay: &UIOverlay,
@@ -160,10 +158,58 @@ fn toggle_ui(
     }
 }
 
+// ===== Client-side network rate limiting =====
+// Only send position updates when player has moved beyond threshold
+
+const CLIENT_POS_THRESHOLD: f32 = 0.01;
+const CLIENT_ANGLE_THRESHOLD: f32 = 0.01;
+
+struct NetRateLimiter {
+    last_pos: [f32; 3],
+    last_yaw: f32,
+    last_pitch: f32,
+    last_on_ground: bool,
+}
+
+impl NetRateLimiter {
+    fn new() -> Self {
+        Self {
+            last_pos: [0.0, 0.0, 0.0],
+            last_yaw: 0.0,
+            last_pitch: 0.0,
+            last_on_ground: false,
+        }
+    }
+
+    /// Returns true if state changed enough to warrant sending an update
+    fn should_send(&mut self, pos: [f32; 3], yaw: f32, pitch: f32, on_ground: bool) -> bool {
+        let pos_delta = (pos[0] - self.last_pos[0]).abs()
+                      + (pos[1] - self.last_pos[1]).abs()
+                      + (pos[2] - self.last_pos[2]).abs();
+        let yaw_delta = (yaw - self.last_yaw).abs();
+        let pitch_delta = (pitch - self.last_pitch).abs();
+        let ground_changed = on_ground != self.last_on_ground;
+
+        if pos_delta > CLIENT_POS_THRESHOLD 
+            || yaw_delta > CLIENT_ANGLE_THRESHOLD 
+            || pitch_delta > CLIENT_ANGLE_THRESHOLD
+            || ground_changed 
+        {
+            self.last_pos = pos;
+            self.last_yaw = yaw;
+            self.last_pitch = pitch;
+            self.last_on_ground = on_ground;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Minecraft");
 
-    // Parse CLI: --host | --connect <ip> [--name <name>]
+    // Parse CLI: --host | --connect <ip> [--name <n>]
     let args: Vec<String> = std::env::args().collect();
     let mut net_mode = "offline";
     let mut connect_ip = String::new();
@@ -222,7 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "client" => {
-            println!("Connecting to {}...", connect_ip);
+            println!("Connecting to {} as '{}'...", connect_ip, player_name);
             match NetworkHandle::connect(&connect_ip, &player_name) {
                 Ok(n) => n,
                 Err(e) => {
@@ -234,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => NetworkHandle::Offline,
     };
 
-    // Track remote players for rendering
+    // Remote players (populated by network events)
     let mut remote_players: StdHashMap<PlayerId, RemotePlayer> = StdHashMap::new();
 
     // Player - spawn above terrain
@@ -262,13 +308,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
     }
+    println!("✓ Player spawned at ({:.0}, {:.0}, {:.0})", player.position[0], player.position[1], player.position[2]);
 
     // Initial mesh upload (only mesh within render distance, buffer ring stays unmeshed)
     print!("  Meshing chunks...");
-    let player_cx = (player.position[0] / CHUNK_X as f32).floor() as i32;
-    let player_cz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
+    let pcx = (player.position[0] / CHUNK_X as f32).floor() as i32;
+    let pcz = (player.position[2] / CHUNK_Z as f32).floor() as i32;
     let chunk_positions: Vec<ChunkPos> = world.chunks.keys()
-        .filter(|p| (p.x - player_cx).abs() <= RENDER_DISTANCE && (p.z - player_cz).abs() <= RENDER_DISTANCE)
+        .filter(|p| (p.x - pcx).abs() <= RENDER_DISTANCE && (p.z - pcz).abs() <= RENDER_DISTANCE)
         .copied().collect();
     for pos in &chunk_positions {
         if world.has_all_neighbors(*pos) {
@@ -322,6 +369,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut input = PlayerInput::default();
 
+    // Client-side network rate limiting
+    let mut net_limiter = NetRateLimiter::new();
+
     // Frame timing accumulators (printed every second)
     let mut t_events = 0.0f64;
     let mut t_update = 0.0f64;
@@ -334,7 +384,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n═══════════════════════════════════");
     println!("  --host         Host a multiplayer game");
     println!("  --connect <ip> Connect to a host");
-    println!("  --name <name>  Set player name");
+    println!("  --name <n>  Set player name");
     println!("  Controls:");
     println!("  WASD       - Move");
     println!("  Mouse      - Look");
@@ -393,85 +443,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.set_title(&format!(
                 "Voxel World | FPS: {} | Pos: ({:.0}, {:.0}, {:.0}) | {} | {} | Chunks: {} | {:02}:{:02} | Place: {:?}{}",
                 last_fps, pos[0], pos[1], pos[2], mode, cam_tag,
-                renderer.chunk_count(), time_hours, time_mins, player.selected_block, ui_tag,
+                renderer.chunk_count(),
+                time_hours, time_mins, player.selected_block, ui_tag
             )).ok();
         }
 
-        // Reset per-frame input
-        input.toggle_fly = false;
+        // ===== Event handling =====
+        let t0 = Instant::now();
+        input.toggle_fly = false; // Reset one-shot
+
         let ui_visible = renderer.ui_manager.visible;
 
-        // ===== Events =====
-        let t0 = Instant::now();
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
 
                 Event::KeyDown { keycode: Some(key), repeat: false, .. } => match key {
-                    Keycode::Q => break 'running,
-
-                    Keycode::U => {
-                        toggle_ui(&mut renderer.ui_manager, &sdl.mouse(), &mut mouse_captured);
-                    }
-
-                    // Toggle camera mode (first/third person)
-                    Keycode::V if !ui_visible => {
-                        player.toggle_camera_mode();
-                    }
-
                     Keycode::Escape => {
-                        if renderer.ui_manager.visible {
-                            // Close UI, recapture mouse
+                        if ui_visible {
+                            // Close UI first
                             toggle_ui(&mut renderer.ui_manager, &sdl.mouse(), &mut mouse_captured);
                         } else if mouse_captured {
+                            // Release mouse
                             sdl.mouse().set_relative_mouse_mode(false);
                             mouse_captured = false;
                         } else {
+                            // Quit
                             break 'running;
                         }
                     }
-
-                    // Movement keys — only process during gameplay (not when UI is open)
-                    Keycode::W if !ui_visible => input.forward = true,
-                    Keycode::S if !ui_visible => input.backward = true,
-                    Keycode::A if !ui_visible => input.left = true,
-                    Keycode::D if !ui_visible => input.right = true,
-                    Keycode::Space if !ui_visible => input.jump = true,
-                    Keycode::LShift if !ui_visible => input.sneak = true,
-                    Keycode::F if !ui_visible => input.toggle_fly = true,
-                    Keycode::T if !ui_visible => {
-                        // Quick-place torch
-                        if mouse_captured {
-                            let eye = player.eye_position();
-                            let dir = player.forward();
-                            if let Some(hit) = world.raycast(eye, dir, 6.0) {
-                                world.set_block(
-                                    hit.place_pos[0], hit.place_pos[1], hit.place_pos[2],
-                                    BlockType::Torch,
-                                );
+                    Keycode::Q => break 'running,
+                    Keycode::U => {
+                        toggle_ui(&mut renderer.ui_manager, &sdl.mouse(), &mut mouse_captured);
+                    }
+                    Keycode::V => {
+                        player.toggle_camera_mode();
+                    }
+                    Keycode::W => input.forward = true,
+                    Keycode::S => input.backward = true,
+                    Keycode::A => input.left = true,
+                    Keycode::D => input.right = true,
+                    Keycode::Space => input.jump = true,
+                    Keycode::LShift => input.sneak = true,
+                    Keycode::F => input.toggle_fly = true,
+                    Keycode::T => {
+                        // Quick torch placement
+                        let eye = player.eye_position();
+                        let dir = player.forward();
+                        if let Some(hit) = world.raycast(eye, dir, 6.0) {
+                            let (px, py, pz) = (hit.place_pos[0], hit.place_pos[1], hit.place_pos[2]);
+                            world.set_block(px, py, pz, BlockType::Torch);
+                            if network.is_online() {
+                                network.request_block_change(px, py, pz, BlockType::Torch);
                             }
                         }
                     }
                     _ => {}
                 },
 
-                Event::KeyUp { keycode: Some(key), .. } => {
-                    // Always release keys (prevents stuck keys if UI opened mid-press)
-                    match key {
-                        Keycode::W => input.forward = false,
-                        Keycode::S => input.backward = false,
-                        Keycode::A => input.left = false,
-                        Keycode::D => input.right = false,
-                        Keycode::Space => input.jump = false,
-                        Keycode::LShift => input.sneak = false,
-                        _ => {}
-                    }
+                Event::KeyUp { keycode: Some(key), .. } => match key {
+                    Keycode::W => input.forward = false,
+                    Keycode::S => input.backward = false,
+                    Keycode::A => input.left = false,
+                    Keycode::D => input.right = false,
+                    Keycode::Space => input.jump = false,
+                    Keycode::LShift => input.sneak = false,
+                    _ => {}
                 },
 
-                // ── Mouse motion ──
-                Event::MouseMotion { x, y, xrel, yrel, .. } => {
-                    if mouse_captured {
-                        // Gameplay look
+                Event::MouseMotion { xrel, yrel, x, y, .. } => {
+                    if mouse_captured && !ui_visible {
                         player.look(xrel as f32, yrel as f32);
                     } else if ui_visible {
                         // Feed absolute position to UI for hover tracking
@@ -495,20 +536,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             renderer.ui_manager.set_mouse_down(true);
                         }
-                    } else if !mouse_captured {
-                        // No UI visible, click recaptures mouse for gameplay
+                    }
+                    // If mouse not captured and UI closed, recapture
+                    else if !mouse_captured && !ui_visible {
                         sdl.mouse().set_relative_mouse_mode(true);
                         mouse_captured = true;
-                    } else {
-                        // Gameplay mode — block interaction
+                    }
+                    // Normal gameplay clicks
+                    else if mouse_captured {
                         let eye = player.eye_position();
                         let dir = player.forward();
-
                         match mouse_btn {
                             MouseButton::Left => {
                                 if let Some(hit) = world.raycast(eye, dir, 6.0) {
                                     let (bx, by, bz) = (hit.block_pos[0], hit.block_pos[1], hit.block_pos[2]);
-                                    // Apply locally immediately (client prediction)
                                     world.set_block(bx, by, bz, BlockType::Air);
                                     // Notify network
                                     if network.is_online() {
@@ -642,15 +683,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             player.update(dt, &input, &world);
         }
 
-        // Send our position to the network (every frame is fine for LAN;
-        // for internet you'd throttle to ~20Hz)
+        // Send our position to the network (only when state changed — mutation-based)
         if network.is_online() {
-            network.send_player_state(
+            if net_limiter.should_send(
                 player.position,
                 player.yaw,
                 player.pitch,
                 player.on_ground,
-            );
+            ) {
+                network.send_player_state(
+                    player.position,
+                    player.yaw,
+                    player.pitch,
+                    player.on_ground,
+                );
+            }
         }
 
         // === Async world update ===

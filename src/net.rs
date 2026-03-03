@@ -1,8 +1,9 @@
 // Architecture: Listen-server with server-authoritative world.
-//   - Server thread owns tick loop at fixed 20 Hz
+//   - Server thread owns tick loop at fixed 60 Hz (configurable)
 //   - TCP: reliable ordered (block changes, chunk data, join/leave)
 //   - UDP: unreliable fast (player positions/rotations)
 //   - Clients send inputs → server simulates → broadcasts state
+//   - Dirty tracking: only broadcast players whose state changed
 //
 
 use std::{
@@ -25,14 +26,20 @@ use crate::world::{BlockType, ChunkPos, CHUNK_X, CHUNK_Y, CHUNK_Z};
 
 pub const DEFAULT_TCP_PORT: u16 = 25565;
 pub const DEFAULT_UDP_PORT: u16 = 25566;
-pub const SERVER_TICK_RATE: u32 = 20;
-pub const TICK_DURATION: Duration = Duration::from_millis(50);
+pub const SERVER_TICK_RATE: u32 = 60;
+pub const TICK_DURATION: Duration = Duration::from_micros(16_667); // ~16.67ms for 60Hz
 pub const MAX_PLAYERS: usize = 8;
 pub const PROTOCOL_MAGIC: u32 = 0x534D5052; // "SMPR"
 pub const PROTOCOL_VERSION: u8 = 1;
 
 const MAX_UDP_PACKET: usize = 1400;
 const MAX_TCP_PAYLOAD: usize = 512 * 1024;
+
+// Delta thresholds for dirty detection
+const POS_EPSILON: f32 = 0.001;
+const ANGLE_EPSILON: f32 = 0.001;
+// Time sync broadcast interval (ticks) — ~3Hz at 60 tick/s
+const TIME_SYNC_INTERVAL: u32 = 20;
 
 pub type PlayerId = u8;
 
@@ -297,6 +304,35 @@ impl RemotePlayer {
     }
 }
 
+// ===== Player State Snapshot for Dirty Detection =====
+
+#[derive(Clone, Copy, Default)]
+struct PlayerSnapshot {
+    position: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+    on_ground: bool,
+}
+
+impl PlayerSnapshot {
+    /// Returns true if current state differs enough from snapshot to warrant broadcast.
+    fn differs_from(&self, pos: [f32; 3], yaw: f32, pitch: f32, on_ground: bool) -> bool {
+        let dp = (self.position[0] - pos[0]).abs()
+               + (self.position[1] - pos[1]).abs()
+               + (self.position[2] - pos[2]).abs();
+        let dy = (self.yaw - yaw).abs();
+        let dpi = (self.pitch - pitch).abs();
+        dp > POS_EPSILON || dy > ANGLE_EPSILON || dpi > ANGLE_EPSILON || self.on_ground != on_ground
+    }
+    
+    fn update(&mut self, pos: [f32; 3], yaw: f32, pitch: f32, on_ground: bool) {
+        self.position = pos;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.on_ground = on_ground;
+    }
+}
+
 // =====================================================================
 //  SERVER
 // =====================================================================
@@ -310,6 +346,9 @@ struct ServerClient {
     yaw: f32,
     pitch: f32,
     on_ground: bool,
+    // Dirty tracking for mutation-based broadcasts
+    dirty: bool,
+    last_snapshot: PlayerSnapshot,
 }
 
 pub struct Server {
@@ -327,6 +366,11 @@ pub struct Server {
     tcp_incoming_tx: Sender<(PlayerId, PacketType, Vec<u8>)>,
     tcp_incoming_rx: Receiver<(PlayerId, PacketType, Vec<u8>)>,
     new_conn_rx: Receiver<TcpStream>,
+    // Sub-tick scheduling counter
+    tick_counter: u32,
+    // Host player dirty tracking
+    host_dirty: bool,
+    host_snapshot: PlayerSnapshot,
 }
 
 impl Server {
@@ -367,11 +411,14 @@ impl Server {
         let mut server = Server {
             cmd_rx, event_tx, tcp_listener, udp_socket,
             clients: HashMap::new(), next_id: 1, seed,
-            game_time: 0.30, // default morning, host will overwrite immediately
+            game_time: 0.30,
             shutdown: shutdown.clone(),
             _threads: vec![accept_handle],
             tcp_incoming_tx: tcp_inc_tx, tcp_incoming_rx: tcp_inc_rx,
             new_conn_rx,
+            tick_counter: 0,
+            host_dirty: false,
+            host_snapshot: PlayerSnapshot::default(),
         };
 
         let handle = thread::Builder::new().name("net-server".into())
@@ -380,17 +427,28 @@ impl Server {
     }
 
     fn run(&mut self) {
-        println!("[server] Listening TCP:{} UDP:{}", DEFAULT_TCP_PORT, DEFAULT_UDP_PORT);
+        println!("[server] Listening TCP:{} UDP:{} @ {}Hz", DEFAULT_TCP_PORT, DEFAULT_UDP_PORT, SERVER_TICK_RATE);
         while !self.shutdown.load(Ordering::Relaxed) {
             let tick = Instant::now();
+            
             self.accept_new_connections();
             self.process_tcp_incoming();
             self.process_udp_incoming();
             self.process_host_commands();
-            self.broadcast_player_states();
-            self.broadcast_time_sync();
+            
+            // Only broadcast dirty players (mutation-based)
+            self.broadcast_dirty_player_states();
+            
+            // Time sync at reduced rate (~3Hz)
+            self.tick_counter = self.tick_counter.wrapping_add(1);
+            if self.tick_counter % TIME_SYNC_INTERVAL == 0 {
+                self.broadcast_time_sync();
+            }
+            
             let elapsed = tick.elapsed();
-            if elapsed < TICK_DURATION { thread::sleep(TICK_DURATION - elapsed); }
+            if elapsed < TICK_DURATION { 
+                thread::sleep(TICK_DURATION - elapsed); 
+            }
         }
         let ids: Vec<_> = self.clients.keys().copied().collect();
         for id in ids { self.disconnect_client(id, "Server shutting down"); }
@@ -467,7 +525,9 @@ impl Server {
             println!("[server] '{}' joined as id={}", name, id);
             self.clients.insert(id, ServerClient {
                 id, name, tcp_stream: stream, udp_addr: None,
-                position: [0.0,80.0,0.0], yaw: 0.0, pitch: 0.0, on_ground: false,
+                position: [0.0, 80.0, 0.0], yaw: 0.0, pitch: 0.0, on_ground: false,
+                dirty: true,  // Broadcast initial state
+                last_snapshot: PlayerSnapshot::default(),
             });
         }
     }
@@ -511,9 +571,19 @@ impl Server {
                     if let Some((id, pos, yaw, pitch, og)) = decode_position_udp(&buf[..len]) {
                         if let Some(c) = self.clients.get_mut(&id) {
                             if c.udp_addr.is_none() { c.udp_addr = Some(addr); }
-                            c.position = pos; c.yaw = yaw; c.pitch = pitch; c.on_ground = og;
+                            // Check if state actually changed before marking dirty
+                            if c.last_snapshot.differs_from(pos, yaw, pitch, og) {
+                                c.position = pos;
+                                c.yaw = yaw;
+                                c.pitch = pitch;
+                                c.on_ground = og;
+                                c.dirty = true;
+                            }
                         }
-                        let _ = self.event_tx.send(NetEvent::PlayerState { id, position: pos, yaw, pitch, on_ground: og });
+                        // Always forward to host game loop for interpolation
+                        let _ = self.event_tx.send(NetEvent::PlayerState { 
+                            id, position: pos, yaw, pitch, on_ground: og 
+                        });
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -527,14 +597,25 @@ impl Server {
             match self.cmd_rx.try_recv() {
                 Ok(cmd) => match cmd {
                     NetCommand::SendPlayerState { position, yaw, pitch, on_ground } => {
-                        let pkt = encode_position_udp(0, position, yaw, pitch, on_ground);
-                        for c in self.clients.values() {
-                            if let Some(a) = c.udp_addr { let _ = self.udp_socket.send_to(&pkt, a); }
+                        // Only broadcast if host state changed
+                        if self.host_snapshot.differs_from(position, yaw, pitch, on_ground) {
+                            self.host_dirty = true;
+                            self.host_snapshot.update(position, yaw, pitch, on_ground);
+                        }
+                        // Broadcast host position to all clients if dirty
+                        if self.host_dirty {
+                            let pkt = encode_position_udp(0, position, yaw, pitch, on_ground);
+                            for c in self.clients.values() {
+                                if let Some(a) = c.udp_addr { let _ = self.udp_socket.send_to(&pkt, a); }
+                            }
+                            self.host_dirty = false;
                         }
                     }
                     NetCommand::RequestBlockChange { wx, wy, wz, block } => {
                         let pkt = encode_block_change(wx, wy, wz, block);
-                        for c in self.clients.values_mut() { let _ = tcp_send(&mut c.tcp_stream, PacketType::BlockChange, &pkt); }
+                        for c in self.clients.values_mut() { 
+                            let _ = tcp_send(&mut c.tcp_stream, PacketType::BlockChange, &pkt); 
+                        }
                     }
                     NetCommand::SendTimeSync { game_time } => {
                         self.game_time = game_time;
@@ -548,15 +629,45 @@ impl Server {
         }
     }
 
-    fn broadcast_player_states(&self) {
-        for s in self.clients.values() {
-            let pkt = encode_position_udp(s.id, s.position, s.yaw, s.pitch, s.on_ground);
-            for r in self.clients.values() {
-                if r.id != s.id { if let Some(a) = r.udp_addr { let _ = self.udp_socket.send_to(&pkt, a); } }
+    /// Broadcast only players whose state has changed since last broadcast.
+    fn broadcast_dirty_player_states(&mut self) {
+        // Collect dirty client data first to avoid borrow issues
+        let dirty_states: Vec<(PlayerId, [f32;3], f32, f32, bool)> = self.clients.values()
+            .filter(|c| c.dirty)
+            .map(|c| (c.id, c.position, c.yaw, c.pitch, c.on_ground))
+            .collect();
+        
+        if dirty_states.is_empty() {
+            return;
+        }
+        
+        // Collect UDP addresses
+        let addrs: Vec<(PlayerId, Option<SocketAddr>)> = self.clients.values()
+            .map(|c| (c.id, c.udp_addr))
+            .collect();
+        
+        // Broadcast each dirty player to all other players
+        for (sid, pos, yaw, pitch, on_ground) in &dirty_states {
+            let pkt = encode_position_udp(*sid, *pos, *yaw, *pitch, *on_ground);
+            for (rid, addr) in &addrs {
+                if rid != sid {
+                    if let Some(a) = addr { 
+                        let _ = self.udp_socket.send_to(&pkt, *a); 
+                    }
+                }
             }
+            // Notify host game loop
             let _ = self.event_tx.send(NetEvent::PlayerState {
-                id: s.id, position: s.position, yaw: s.yaw, pitch: s.pitch, on_ground: s.on_ground,
+                id: *sid, position: *pos, yaw: *yaw, pitch: *pitch, on_ground: *on_ground,
             });
+        }
+        
+        // Clear dirty flags and update snapshots
+        for c in self.clients.values_mut() {
+            if c.dirty {
+                c.last_snapshot.update(c.position, c.yaw, c.pitch, c.on_ground);
+                c.dirty = false;
+            }
         }
     }
 
