@@ -541,6 +541,7 @@ fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32,
 
 /// Emit an X-shaped cross billboard for foliage blocks (tall grass, flowers).
 /// Two quads crossing diagonally through the block center, both sides rendered.
+/// Rotation is randomized per-block based on world position hash.
 /// Uses normal_idx=6 as sentinel for cross-billboard shading in fragment shader.
 fn emit_cross_billboard(
     verts: &mut Vec<BlockVertex>,
@@ -551,24 +552,44 @@ fn emit_cross_billboard(
     blk_val: f32,
     tile_index: u8,
 ) {
-    // Cross diagonals at 45° through block center.
-    // Slight inset prevents z-fighting at chunk boundaries.
-    let inset = 0.15;
-    let x0 = x + inset;
-    let x1 = x + 1.0 - inset;
-    let z0 = z + inset;
-    let z1 = z + 1.0 - inset;
+    // Hash world position to pick rotation angle
+    let ix = x as i32;
+    let iz = z as i32;
+    let mut h = (ix as u32).wrapping_mul(0x9e3779b9) ^ (iz as u32).wrapping_mul(0x517cc1b7);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    // Pick angle from [0, PI) — cross has 180° symmetry so this covers all unique rotations
+    let angle = (h & 0xFFFF) as f32 / 65536.0 * std::f32::consts::PI;
+    let cos_a = angle.cos();
+    let sin_a = angle.sin();
+
+    let cx = x + 0.5;
+    let cz = z + 0.5;
     let y0 = y;
     let y1 = y + 1.0;
 
-    // normal_idx=6: sentinel for cross-billboard (no directional light, full ambient)
+    // Radius from center to each corner (inset from full 0.5)
+    let r = 0.35;
+
+    // Rotate corner offsets around block center
+    // Diagonal A: (-r, -r) to (r, r) rotated by angle
+    let a0x = cx + cos_a * (-r) - sin_a * (-r);
+    let a0z = cz + sin_a * (-r) + cos_a * (-r);
+    let a1x = cx + cos_a * r - sin_a * r;
+    let a1z = cz + sin_a * r + cos_a * r;
+
+    // Diagonal B: perpendicular — (r, -r) to (-r, r)
+    let b0x = cx + cos_a * r - sin_a * (-r);
+    let b0z = cz + sin_a * r + cos_a * (-r);
+    let b1x = cx + cos_a * (-r) - sin_a * r;
+    let b1z = cz + sin_a * (-r) + cos_a * r;
+
     let ni: u8 = 6;
 
     let mut quad = |v0: [f32;3], v1: [f32;3], v2: [f32;3], v3: [f32;3]| {
         let base = verts.len() as u32;
         // v0=bottom-left, v1=bottom-right, v2=top-right, v3=top-left
-        // UV corners: 0=TL(0,0), 1=TR(1,0), 2=BR(1,1), 3=BL(0,1)
-        // Bottom verts need bottom UVs (3,2), top verts need top UVs (1,0)
+        // UV: bottom verts get bottom UVs, top verts get top UVs
         verts.push(BlockVertex::new_dual(v0, color, ni, 1.0, sky_val, blk_val, tile_index, 3));
         verts.push(BlockVertex::new_dual(v1, color, ni, 1.0, sky_val, blk_val, tile_index, 2));
         verts.push(BlockVertex::new_dual(v2, color, ni, 1.0, sky_val, blk_val, tile_index, 1));
@@ -576,12 +597,12 @@ fn emit_cross_billboard(
         idxs.extend_from_slice(&[base, base+1, base+2, base+2, base+3, base]);
     };
 
-    // Quad A front + back: (x0,z0) → (x1,z1)
-    quad([x0,y0,z0], [x1,y0,z1], [x1,y1,z1], [x0,y1,z0]);
-    quad([x1,y0,z1], [x0,y0,z0], [x0,y1,z0], [x1,y1,z1]);
-    // Quad B front + back: (x1,z0) → (x0,z1)
-    quad([x1,y0,z0], [x0,y0,z1], [x0,y1,z1], [x1,y1,z0]);
-    quad([x0,y0,z1], [x1,y0,z0], [x1,y1,z0], [x0,y1,z1]);
+    // Quad A front + back
+    quad([a0x,y0,a0z], [a1x,y0,a1z], [a1x,y1,a1z], [a0x,y1,a0z]);
+    quad([a1x,y0,a1z], [a0x,y0,a0z], [a0x,y1,a0z], [a1x,y1,a1z]);
+    // Quad B front + back
+    quad([b0x,y0,b0z], [b1x,y0,b1z], [b1x,y1,b1z], [b0x,y1,b0z]);
+    quad([b1x,y0,b1z], [b0x,y0,b0z], [b0x,y1,b0z], [b1x,y1,b1z]);
 }
 
 fn add_face_ao(
