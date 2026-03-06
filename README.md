@@ -1,1 +1,3 @@
-# mine-rs
+# Mine-RS
+
+![img](./assets/captures/cap.png)
