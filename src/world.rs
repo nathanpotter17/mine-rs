@@ -10,24 +10,25 @@ pub enum BlockType {
     Air = 0, Grass = 1, Dirt = 2, Stone = 3, Sand = 4, Water = 5,
     Wood = 6, Leaves = 7, Snow = 8, Bedrock = 9, Gravel = 10,
     Coal = 11, Iron = 12, Gold = 13, Diamond = 14, Torch = 15,
+    TallGrass = 16,
 }
 
 impl BlockType {
     #[inline(always)]
     pub fn is_solid(self) -> bool {
-        const S: [bool; 16] = [false,true,true,true,true,false,true,true,true,true,true,true,true,true,true,false];
+        const S: [bool; 17] = [false,true,true,true,true,false,true,true,true,true,true,true,true,true,true,false,false];
         S[self as usize]
     }
     #[inline(always)]
     pub fn is_transparent(self) -> bool {
-        const T: [bool; 16] = [true,false,false,false,false,true,false,true,false,false,false,false,false,false,false,true];
+        const T: [bool; 17] = [true,false,false,false,false,true,false,true,false,false,false,false,false,false,false,true,true];
         T[self as usize]
     }
     pub fn is_light_source(self) -> bool { matches!(self, BlockType::Torch) }
     pub fn light_level(self) -> u8 { match self { BlockType::Torch => 15, _ => 0 } }
 
     pub fn from_u8(v: u8) -> Option<Self> {
-        if v <= Self::Torch as u8 {  // last variant
+        if v <= Self::TallGrass as u8 {
             Some(unsafe { std::mem::transmute(v) })
         } else {
             None
@@ -40,6 +41,9 @@ impl BlockType {
     /// Row 2 (tiles 32-47) = bottom faces
     #[inline(always)]
     pub fn tile_index(self, face: Face) -> u8 {
+        if self == BlockType::TallGrass {
+            return 48; // row 3, col 0 — single tile for all cross faces
+        }
         let base = self as u8;
         match face {
             Face::Top    => base,       // row 0
@@ -68,6 +72,7 @@ impl BlockType {
             BlockType::Gold    => ([0.90,0.78,0.20],[0.85,0.73,0.18],[0.80,0.68,0.15]),
             BlockType::Diamond => ([0.45,0.85,0.90],[0.40,0.80,0.85],[0.35,0.75,0.80]),
             BlockType::Torch   => ([0.95,0.85,0.45],[0.90,0.75,0.30],[0.90,0.75,0.30]),
+            BlockType::TallGrass => ([0.25,0.60,0.15],[0.25,0.60,0.15],[0.25,0.60,0.15]),
             BlockType::Air     => ([0.0;3],[0.0;3],[0.0;3]),
         }
     }
@@ -115,7 +120,8 @@ impl ChunkPos {
 
 pub struct Chunk {
     blocks: Vec<BlockType>,
-    light_map: Vec<u8>,
+    sky_light: Vec<u8>,     // 0-15 skylight per voxel
+    block_light: Vec<u8>,   // 0-15 blocklight per voxel
     pub pos: ChunkPos,
     pub dirty: bool,
     pub light_dirty: bool,
@@ -127,7 +133,8 @@ impl Chunk {
     pub fn new(pos: ChunkPos) -> Self {
         Self {
             blocks: vec![BlockType::Air; CHUNK_X * CHUNK_Y * CHUNK_Z],
-            light_map: vec![0u8; CHUNK_X * CHUNK_Y * CHUNK_Z],
+            sky_light: vec![0u8; CHUNK_X * CHUNK_Y * CHUNK_Z],
+            block_light: vec![0u8; CHUNK_X * CHUNK_Y * CHUNK_Z],
             pos, dirty: true, light_dirty: true, min_y: CHUNK_Y, max_y: 0,
         }
     }
@@ -156,63 +163,112 @@ impl Chunk {
     }
 
     #[inline(always)]
-    pub fn get_light(&self, x: usize, y: usize, z: usize) -> u8 {
+    pub fn get_sky_light(&self, x: usize, y: usize, z: usize) -> u8 {
         if x < CHUNK_X && y < CHUNK_Y && z < CHUNK_Z {
-            unsafe { *self.light_map.get_unchecked(Self::index(x, y, z)) }
+            unsafe { *self.sky_light.get_unchecked(Self::index(x, y, z)) }
         } else { 0 }
     }
 
     #[inline(always)]
-    pub fn set_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+    pub fn set_sky_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
         if x < CHUNK_X && y < CHUNK_Y && z < CHUNK_Z {
-            unsafe { *self.light_map.get_unchecked_mut(Self::index(x, y, z)) = level; }
+            unsafe { *self.sky_light.get_unchecked_mut(Self::index(x, y, z)) = level; }
         }
     }
 
-    pub fn propagate_light(&mut self) {
-        self.light_map.fill(0);
-        let mut queue: VecDeque<(usize, usize, usize, u8)> = VecDeque::with_capacity(512);
-        let scan_max = (self.max_y + 15).min(CHUNK_Y - 1);
-        for y in self.min_y.saturating_sub(1)..=scan_max {
-            for z in 0..CHUNK_Z { for x in 0..CHUNK_X {
-                let block = self.get(x, y, z);
-                if block.is_light_source() {
-                    let level = block.light_level();
-                    self.set_light(x, y, z, level);
-                    queue.push_back((x, y, z, level));
-                }
-            }}
+    #[inline(always)]
+    pub fn get_block_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        if x < CHUNK_X && y < CHUNK_Y && z < CHUNK_Z {
+            unsafe { *self.block_light.get_unchecked(Self::index(x, y, z)) }
+        } else { 0 }
+    }
+
+    #[inline(always)]
+    pub fn set_block_light(&mut self, x: usize, y: usize, z: usize, level: u8) {
+        if x < CHUNK_X && y < CHUNK_Y && z < CHUNK_Z {
+            unsafe { *self.block_light.get_unchecked_mut(Self::index(x, y, z)) = level; }
         }
-        for z in 0..CHUNK_Z { for x in 0..CHUNK_X {
-            let mut in_sky = true;
-            for y in (0..CHUNK_Y).rev() {
-                if in_sky {
-                    if self.get(x, y, z).is_solid() { in_sky = false; }
-                    else {
-                        let sky_level = 12u8;
-                        if sky_level > self.get_light(x, y, z) {
-                            self.set_light(x, y, z, sky_level);
-                            queue.push_back((x, y, z, sky_level));
-                        }
+    }
+
+    /// Combined light: max(sky, block). Backward compat for neighbor lookups.
+    #[inline(always)]
+    pub fn get_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        self.get_sky_light(x, y, z).max(self.get_block_light(x, y, z))
+    }
+
+    pub fn propagate_light(&mut self) {
+        self.sky_light.fill(0);
+        self.block_light.fill(0);
+        let scan_max = (self.max_y + 15).min(CHUNK_Y - 1);
+        const OFF: [(i32,i32,i32);6] = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)];
+
+        // === Pass 1: Block light (torches, emissives) ===
+        {
+            let mut queue: VecDeque<(usize, usize, usize, u8)> = VecDeque::with_capacity(256);
+            for y in self.min_y.saturating_sub(1)..=scan_max {
+                for z in 0..CHUNK_Z { for x in 0..CHUNK_X {
+                    let block = self.get(x, y, z);
+                    if block.is_light_source() {
+                        let level = block.light_level();
+                        self.set_block_light(x, y, z, level);
+                        queue.push_back((x, y, z, level));
+                    }
+                }}
+            }
+            while let Some((x, y, z, level)) = queue.pop_front() {
+                if level <= 1 { continue; }
+                let new_level = level - 1;
+                for &(dx, dy, dz) in &OFF {
+                    let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                    if nx < 0 || nx >= CHUNK_X as i32 || ny < 0 || ny >= CHUNK_Y as i32
+                        || nz < 0 || nz >= CHUNK_Z as i32 { continue; }
+                    let (ux, uy, uz) = (nx as usize, ny as usize, nz as usize);
+                    if !self.get(ux, uy, uz).is_solid()
+                        && self.get_block_light(ux, uy, uz) < new_level
+                    {
+                        self.set_block_light(ux, uy, uz, new_level);
+                        queue.push_back((ux, uy, uz, new_level));
                     }
                 }
             }
-        }}
-        const OFF: [(i32,i32,i32);6] = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)];
-        while let Some((x, y, z, level)) = queue.pop_front() {
-            if level <= 1 { continue; }
-            let new_level = level - 1;
-            for &(dx, dy, dz) in &OFF {
-                let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
-                if nx < 0 || nx >= CHUNK_X as i32 || ny < 0 || ny >= CHUNK_Y as i32
-                    || nz < 0 || nz >= CHUNK_Z as i32 { continue; }
-                let (ux, uy, uz) = (nx as usize, ny as usize, nz as usize);
-                if !self.get(ux, uy, uz).is_solid() && self.get_light(ux, uy, uz) < new_level {
-                    self.set_light(ux, uy, uz, new_level);
-                    queue.push_back((ux, uy, uz, new_level));
+        }
+
+        // === Pass 2: Sky light (top-down column + BFS spread) ===
+        {
+            let mut queue: VecDeque<(usize, usize, usize, u8)> = VecDeque::with_capacity(512);
+            for z in 0..CHUNK_Z { for x in 0..CHUNK_X {
+                let mut in_sky = true;
+                for y in (0..CHUNK_Y).rev() {
+                    if in_sky {
+                        if self.get(x, y, z).is_solid() { in_sky = false; }
+                        else {
+                            let sky_level = 15u8;
+                            if sky_level > self.get_sky_light(x, y, z) {
+                                self.set_sky_light(x, y, z, sky_level);
+                                queue.push_back((x, y, z, sky_level));
+                            }
+                        }
+                    }
+                }
+            }}
+            while let Some((x, y, z, level)) = queue.pop_front() {
+                if level <= 1 { continue; }
+                let new_level = level - 1;
+                for &(dx, dy, dz) in &OFF {
+                    let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                    if nx < 0 || nx >= CHUNK_X as i32 || ny < 0 || ny >= CHUNK_Y as i32
+                        || nz < 0 || nz >= CHUNK_Z as i32 { continue; }
+                    let (ux, uy, uz) = (nx as usize, ny as usize, nz as usize);
+                    if !self.get(ux, uy, uz).is_solid()
+                        && self.get_sky_light(ux, uy, uz) < new_level
+                    {
+                        self.set_sky_light(ux, uy, uz, new_level);
+                        queue.push_back((ux, uy, uz, new_level));
+                    }
                 }
             }
         }
+
         self.light_dirty = false;
     }
 
@@ -259,27 +315,35 @@ pub struct BlockVertex {
 }
 
 impl BlockVertex {
-    /// Pack tint color, AO, normal, light, tile_index, uv_corner into 20 bytes.
+    /// Pack tint color, AO, normal, sky+block light, tile_index, uv_corner into 20 bytes.
     ///
-    /// - `color`: [f32;3] tint that modulates the atlas texture
-    /// - `normal_idx`: 0-5 (Face enum order)
-    /// - `ao`: 0.0-1.0 ambient occlusion
-    /// - `light`: 0.0-1.0 light level
-    /// - `tile_index`: 0-255 atlas tile (row*16 + col in 16×16 grid)
-    /// - `uv_corner`: 0-3 which quad corner (0=TL, 1=TR, 2=BR, 3=BL)
+    /// Light encoding: G8 = (sky_4bits << 4) | block_4bits
+    /// `light` param treated as sky_light for backward compat; block_light = 0.
     #[inline]
     pub fn new(
         position: [f32; 3], color: [f32; 3], normal_idx: u8,
         ao: f32, light: f32, tile_index: u8, uv_corner: u8,
+    ) -> Self {
+        Self::new_dual(position, color, normal_idx, ao, light, 0.0, tile_index, uv_corner)
+    }
+
+    /// Full dual-light constructor: sky_light and block_light as separate [0.0-1.0] values.
+    #[inline]
+    pub fn new_dual(
+        position: [f32; 3], color: [f32; 3], normal_idx: u8,
+        ao: f32, sky_light: f32, block_light: f32, tile_index: u8, uv_corner: u8,
     ) -> Self {
         let r = (color[0] * 255.0 + 0.5) as u8;
         let g = (color[1] * 255.0 + 0.5) as u8;
         let b = (color[2] * 255.0 + 0.5) as u8;
         let a = (ao.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         let color_ao = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24);
-        let light_u8 = (light.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        // Pack sky (high nibble) + block (low nibble) into one byte
+        let sky_4 = (sky_light.clamp(0.0, 1.0) * 15.0 + 0.5) as u8;
+        let blk_4 = (block_light.clamp(0.0, 1.0) * 15.0 + 0.5) as u8;
+        let light_packed = (sky_4 << 4) | (blk_4 & 0x0F);
         let normal_light = (normal_idx as u32)
-            | ((light_u8 as u32) << 8)
+            | ((light_packed as u32) << 8)
             | ((tile_index as u32) << 16)
             | ((uv_corner as u32) << 24);
         Self { position, color_ao, normal_light }
@@ -326,9 +390,23 @@ fn get_block_with_neighbors(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y
 
 #[inline(always)]
 fn get_light_with_neighbors(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> u8 {
-    if y < 0 { return 0; } if y >= CHUNK_Y as i32 { return 12; }
+    if y < 0 { return 0; } if y >= CHUNK_Y as i32 { return 15; }
     let (t, lx, lz) = resolve_chunk(chunk, neighbors, x, z);
     t.map_or(0, |c| c.get_light(lx, y as usize, lz))
+}
+
+#[inline(always)]
+fn get_sky_light_with_neighbors(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> u8 {
+    if y < 0 { return 0; } if y >= CHUNK_Y as i32 { return 15; }
+    let (t, lx, lz) = resolve_chunk(chunk, neighbors, x, z);
+    t.map_or(0, |c| c.get_sky_light(lx, y as usize, lz))
+}
+
+#[inline(always)]
+fn get_block_light_with_neighbors(chunk: &Chunk, neighbors: &ChunkNeighbors, x: i32, y: i32, z: i32) -> u8 {
+    if y < 0 { return 0; } if y >= CHUNK_Y as i32 { return 0; }
+    let (t, lx, lz) = resolve_chunk(chunk, neighbors, x, z);
+    t.map_or(0, |c| c.get_block_light(lx, y as usize, lz))
 }
 
 // ===== Precomputed AO + Light Tables =====
@@ -390,6 +468,38 @@ fn compute_light_generic(x: i32, y: i32, z: i32, face: Face, get: &impl Fn(i32,i
 
 // ===== Mesh geometry emission =====
 
+/// Compute per-vertex sky light for a face (4 corners, smoothed from neighbors)
+#[inline]
+fn compute_sky_light_generic(x: i32, y: i32, z: i32, face: Face, get: &impl Fn(i32,i32,i32)->u8) -> [f32;4] {
+    let off = face.offset();
+    let (fx,fy,fz) = (x+off[0], y+off[1], z+off[2]);
+    let center = get(fx,fy,fz) as u32;
+    let offsets = &LIGHT_OFFSETS[face as usize];
+    let mut lights = [0.0f32;4];
+    for (i, samples) in offsets.iter().enumerate() {
+        let mut total = center;
+        for &(sx,sy,sz) in samples { total += get(fx+sx,fy+sy,fz+sz) as u32; }
+        lights[i] = (total as f32 / (4.0 * 15.0)).clamp(0.0, 1.0);
+    }
+    lights
+}
+
+/// Compute per-vertex block light for a face (4 corners, smoothed from neighbors)
+#[inline]
+fn compute_block_light_generic(x: i32, y: i32, z: i32, face: Face, get: &impl Fn(i32,i32,i32)->u8) -> [f32;4] {
+    let off = face.offset();
+    let (fx,fy,fz) = (x+off[0], y+off[1], z+off[2]);
+    let center = get(fx,fy,fz) as u32;
+    let offsets = &LIGHT_OFFSETS[face as usize];
+    let mut lights = [0.0f32;4];
+    for (i, samples) in offsets.iter().enumerate() {
+        let mut total = center;
+        for &(sx,sy,sz) in samples { total += get(fx+sx,fy+sy,fz+sz) as u32; }
+        lights[i] = (total as f32 / (4.0 * 15.0)).clamp(0.0, 1.0);
+    }
+    lights
+}
+
 fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32, z: f32, _light_val: f32) {
     // Proper 3D box torch: 4 sides + top. No cross-billboard nonsense.
     // Self-illuminated: AO=1.0, light=1.0 for full brightness.
@@ -402,10 +512,11 @@ fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32,
     // Helper: emit one quad with correct winding
     let mut quad = |v0: [f32;3], v1: [f32;3], v2: [f32;3], v3: [f32;3], ni: u8, c: [f32;3], ti: u8| {
         let base = verts.len() as u32;
-        verts.push(BlockVertex::new(v0, c, ni, 1.0, 1.0, ti, 0));
-        verts.push(BlockVertex::new(v1, c, ni, 1.0, 1.0, ti, 1));
-        verts.push(BlockVertex::new(v2, c, ni, 1.0, 1.0, ti, 2));
-        verts.push(BlockVertex::new(v3, c, ni, 1.0, 1.0, ti, 3));
+        // Torches: sky=from neighbors, block=1.0 (self-illuminated)
+        verts.push(BlockVertex::new_dual(v0, c, ni, 1.0, _light_val, 1.0, ti, 0));
+        verts.push(BlockVertex::new_dual(v1, c, ni, 1.0, _light_val, 1.0, ti, 1));
+        verts.push(BlockVertex::new_dual(v2, c, ni, 1.0, _light_val, 1.0, ti, 2));
+        verts.push(BlockVertex::new_dual(v3, c, ni, 1.0, _light_val, 1.0, ti, 3));
         idxs.extend_from_slice(&[base, base+1, base+2, base+2, base+3, base]);
     };
 
@@ -428,6 +539,51 @@ fn emit_torch(verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>, x: f32, y: f32,
     quad([x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1], 0, flame, flame_tile);
 }
 
+/// Emit an X-shaped cross billboard for foliage blocks (tall grass, flowers).
+/// Two quads crossing diagonally through the block center, both sides rendered.
+/// Uses normal_idx=6 as sentinel for cross-billboard shading in fragment shader.
+fn emit_cross_billboard(
+    verts: &mut Vec<BlockVertex>,
+    idxs: &mut Vec<u32>,
+    x: f32, y: f32, z: f32,
+    color: [f32; 3],
+    sky_val: f32,
+    blk_val: f32,
+    tile_index: u8,
+) {
+    // Cross diagonals at 45° through block center.
+    // Slight inset prevents z-fighting at chunk boundaries.
+    let inset = 0.15;
+    let x0 = x + inset;
+    let x1 = x + 1.0 - inset;
+    let z0 = z + inset;
+    let z1 = z + 1.0 - inset;
+    let y0 = y;
+    let y1 = y + 1.0;
+
+    // normal_idx=6: sentinel for cross-billboard (no directional light, full ambient)
+    let ni: u8 = 6;
+
+    let mut quad = |v0: [f32;3], v1: [f32;3], v2: [f32;3], v3: [f32;3]| {
+        let base = verts.len() as u32;
+        // v0=bottom-left, v1=bottom-right, v2=top-right, v3=top-left
+        // UV corners: 0=TL(0,0), 1=TR(1,0), 2=BR(1,1), 3=BL(0,1)
+        // Bottom verts need bottom UVs (3,2), top verts need top UVs (1,0)
+        verts.push(BlockVertex::new_dual(v0, color, ni, 1.0, sky_val, blk_val, tile_index, 3));
+        verts.push(BlockVertex::new_dual(v1, color, ni, 1.0, sky_val, blk_val, tile_index, 2));
+        verts.push(BlockVertex::new_dual(v2, color, ni, 1.0, sky_val, blk_val, tile_index, 1));
+        verts.push(BlockVertex::new_dual(v3, color, ni, 1.0, sky_val, blk_val, tile_index, 0));
+        idxs.extend_from_slice(&[base, base+1, base+2, base+2, base+3, base]);
+    };
+
+    // Quad A front + back: (x0,z0) → (x1,z1)
+    quad([x0,y0,z0], [x1,y0,z1], [x1,y1,z1], [x0,y1,z0]);
+    quad([x1,y0,z1], [x0,y0,z0], [x0,y1,z0], [x1,y1,z1]);
+    // Quad B front + back: (x1,z0) → (x0,z1)
+    quad([x1,y0,z0], [x0,y0,z1], [x0,y1,z1], [x1,y1,z0]);
+    quad([x0,y0,z1], [x1,y0,z0], [x1,y1,z0], [x0,y1,z1]);
+}
+
 fn add_face_ao(
     verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>,
     x: f32, y: f32, z: f32, face: Face, color: [f32;3],
@@ -443,7 +599,6 @@ fn add_face_ao(
         Face::East   => ([x+1.0,y,z],[x+1.0,y,z+1.0],[x+1.0,y+1.0,z+1.0],[x+1.0,y+1.0,z]),
         Face::West   => ([x,y,z+1.0],[x,y,z],[x,y+1.0,z],[x,y+1.0,z+1.0]),
     };
-    // uv_corner 0-3 maps to quad corners: v0=TL, v1=TR, v2=BR, v3=BL
     verts.push(BlockVertex::new(v0, color, ni, ao[0], light[0], tile_index, 0));
     verts.push(BlockVertex::new(v1, color, ni, ao[1], light[1], tile_index, 1));
     verts.push(BlockVertex::new(v2, color, ni, ao[2], light[2], tile_index, 2));
@@ -455,13 +610,40 @@ fn add_face_ao(
     }
 }
 
-// ===== Meshing: generic inner loop =====
+fn add_face_ao_dual(
+    verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>,
+    x: f32, y: f32, z: f32, face: Face, color: [f32;3],
+    ao: [f32;4], sky: [f32;4], blk: [f32;4], ao_raw: [u8;4], tile_index: u8,
+) {
+    let base = verts.len() as u32;
+    let ni = face as u8;
+    let (v0,v1,v2,v3) = match face {
+        Face::Top    => ([x,y+1.0,z],[x+1.0,y+1.0,z],[x+1.0,y+1.0,z+1.0],[x,y+1.0,z+1.0]),
+        Face::Bottom => ([x,y,z+1.0],[x+1.0,y,z+1.0],[x+1.0,y,z],[x,y,z]),
+        Face::North  => ([x+1.0,y,z+1.0],[x,y,z+1.0],[x,y+1.0,z+1.0],[x+1.0,y+1.0,z+1.0]),
+        Face::South  => ([x,y,z],[x+1.0,y,z],[x+1.0,y+1.0,z],[x,y+1.0,z]),
+        Face::East   => ([x+1.0,y,z],[x+1.0,y,z+1.0],[x+1.0,y+1.0,z+1.0],[x+1.0,y+1.0,z]),
+        Face::West   => ([x,y,z+1.0],[x,y,z],[x,y+1.0,z],[x,y+1.0,z+1.0]),
+    };
+    verts.push(BlockVertex::new_dual(v0, color, ni, ao[0], sky[0], blk[0], tile_index, 0));
+    verts.push(BlockVertex::new_dual(v1, color, ni, ao[1], sky[1], blk[1], tile_index, 1));
+    verts.push(BlockVertex::new_dual(v2, color, ni, ao[2], sky[2], blk[2], tile_index, 2));
+    verts.push(BlockVertex::new_dual(v3, color, ni, ao[3], sky[3], blk[3], tile_index, 3));
+    if ao_raw[0] + ao_raw[2] > ao_raw[1] + ao_raw[3] {
+        idxs.extend_from_slice(&[base,base+1,base+2, base+2,base+3,base]);
+    } else {
+        idxs.extend_from_slice(&[base+1,base+2,base+3, base+3,base,base+1]);
+    }
+}
+
+// ===== Meshing: generic inner loop (dual-channel sky+block light) =====
 
 fn mesh_inner(
     verts: &mut Vec<BlockVertex>, idxs: &mut Vec<u32>,
     ox: f32, oz: f32, scan_min: usize, scan_max: usize,
     get_nb_block: impl Fn(i32,i32,i32)->BlockType,
-    get_nb_light: impl Fn(i32,i32,i32)->u8,
+    get_nb_sky: impl Fn(i32,i32,i32)->u8,
+    get_nb_blk: impl Fn(i32,i32,i32)->u8,
     get_local: impl Fn(usize,usize,usize)->BlockType,
 ) {
     for y in scan_min..=scan_max { for z in 0..CHUNK_Z { for x in 0..CHUNK_X {
@@ -470,7 +652,16 @@ fn mesh_inner(
         let (wx, wy, wz) = (ox + x as f32, y as f32, oz + z as f32);
         let (ix, iy, iz) = (x as i32, y as i32, z as i32);
         if block == BlockType::Torch {
-            emit_torch(verts, idxs, wx, wy, wz, (get_nb_light(ix,iy,iz) as f32 / 15.0).max(0.9));
+            let sky_val = (get_nb_sky(ix,iy,iz) as f32 / 15.0).max(0.5);
+            emit_torch(verts, idxs, wx, wy, wz, sky_val);
+            continue;
+        }
+        if block == BlockType::TallGrass {
+            let sky_val = get_nb_sky(ix, iy, iz) as f32 / 15.0;
+            let blk_val = get_nb_blk(ix, iy, iz) as f32 / 15.0;
+            let tile = block.tile_index(Face::Top);
+            emit_cross_billboard(verts, idxs, wx, wy, wz,
+                block.color_for_face(Face::Top), sky_val, blk_val, tile);
             continue;
         }
         for face in Face::ALL {
@@ -478,10 +669,13 @@ fn mesh_inner(
             let nb = get_nb_block(ix+off[0], iy+off[1], iz+off[2]);
             if nb.is_transparent() && nb != block {
                 let ao_raw = compute_ao_generic(ix,iy,iz,face,&get_nb_block);
-                let ao = [ao_raw[0] as f32*INV_3, ao_raw[1] as f32*INV_3, ao_raw[2] as f32*INV_3, ao_raw[3] as f32*INV_3];
-                let light = compute_light_generic(ix,iy,iz,face,&get_nb_light);
+                let ao = [ao_raw[0] as f32*INV_3, ao_raw[1] as f32*INV_3,
+                          ao_raw[2] as f32*INV_3, ao_raw[3] as f32*INV_3];
+                let sky = compute_sky_light_generic(ix,iy,iz,face,&get_nb_sky);
+                let blk = compute_block_light_generic(ix,iy,iz,face,&get_nb_blk);
                 let tile = block.tile_index(face);
-                add_face_ao(verts, idxs, wx, wy, wz, face, block.color_for_face(face), ao, light, ao_raw, tile);
+                add_face_ao_dual(verts, idxs, wx, wy, wz, face,
+                    block.color_for_face(face), ao, sky, blk, ao_raw, tile);
             }
         }
     }}}
@@ -497,7 +691,8 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &ChunkNeighbors) -> ChunkMesh {
     if scan_min <= scan_max {
         mesh_inner(&mut verts, &mut idxs, ox, oz, scan_min, scan_max,
             |x,y,z| get_block_with_neighbors(chunk, neighbors, x, y, z),
-            |x,y,z| get_light_with_neighbors(chunk, neighbors, x, y, z),
+            |x,y,z| get_sky_light_with_neighbors(chunk, neighbors, x, y, z),
+            |x,y,z| get_block_light_with_neighbors(chunk, neighbors, x, y, z),
             |x,y,z| chunk.get(x, y, z));
     }
     ChunkMesh { vertices: verts, indices: idxs, pos: chunk.pos }
@@ -594,13 +789,14 @@ fn compute_column(wx: f32, wz: f32, lx: usize, lz: usize, noise: &Noise, tree_no
 // ===== Chunk Snapshot for off-thread meshing =====
 
 struct ChunkSnapshot {
-    blocks: Vec<BlockType>, light_map: Vec<u8>,
+    blocks: Vec<BlockType>, sky_light: Vec<u8>, block_light: Vec<u8>,
     pos: ChunkPos, min_y: usize, max_y: usize,
 }
 
 impl ChunkSnapshot {
     fn from_chunk(c: &Chunk) -> Self {
-        Self { blocks: c.blocks.clone(), light_map: c.light_map.clone(), pos: c.pos, min_y: c.min_y, max_y: c.max_y }
+        Self { blocks: c.blocks.clone(), sky_light: c.sky_light.clone(),
+               block_light: c.block_light.clone(), pos: c.pos, min_y: c.min_y, max_y: c.max_y }
     }
     #[inline(always)]
     fn get(&self, x: usize, y: usize, z: usize) -> BlockType {
@@ -609,10 +805,20 @@ impl ChunkSnapshot {
         } else { BlockType::Air }
     }
     #[inline(always)]
-    fn get_light(&self, x: usize, y: usize, z: usize) -> u8 {
+    fn get_sky_light(&self, x: usize, y: usize, z: usize) -> u8 {
         if x < CHUNK_X && y < CHUNK_Y && z < CHUNK_Z {
-            unsafe { *self.light_map.get_unchecked(Chunk::index(x,y,z)) }
+            unsafe { *self.sky_light.get_unchecked(Chunk::index(x,y,z)) }
         } else { 0 }
+    }
+    #[inline(always)]
+    fn get_block_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        if x < CHUNK_X && y < CHUNK_Y && z < CHUNK_Z {
+            unsafe { *self.block_light.get_unchecked(Chunk::index(x,y,z)) }
+        } else { 0 }
+    }
+    #[inline(always)]
+    fn get_light(&self, x: usize, y: usize, z: usize) -> u8 {
+        self.get_sky_light(x, y, z).max(self.get_block_light(x, y, z))
     }
 }
 
@@ -655,9 +861,14 @@ fn mesh_from_snapshot(job: &MeshJob) -> ChunkMesh {
                 t.map_or(BlockType::Air, |s| s.get(lx, y as usize, lz))
             },
             |x,y,z| {
-                if y<0 { return 0; } if y>=CHUNK_Y as i32 { return 12; }
+                if y<0 { return 0; } if y>=CHUNK_Y as i32 { return 15; }
                 let (t,lx,lz) = snap_resolve(c, job, x, z);
-                t.map_or(0, |s| s.get_light(lx, y as usize, lz))
+                t.map_or(0, |s| s.get_sky_light(lx, y as usize, lz))
+            },
+            |x,y,z| {
+                if y<0 { return 0; } if y>=CHUNK_Y as i32 { return 0; }
+                let (t,lx,lz) = snap_resolve(c, job, x, z);
+                t.map_or(0, |s| s.get_block_light(lx, y as usize, lz))
             },
             |x,y,z| c.get(x,y,z));
     }
@@ -814,6 +1025,16 @@ fn gen_chunk_cached(pos: ChunkPos, noise: &Noise, _tn: &Noise, hm: &HeightmapCac
         }
         if col.is_water { for y in (col.height+1)..SEA_LEVEL { chunk.set(x, y, z, BlockType::Water); } }
         if col.can_have_tree { place_tree(&mut chunk, x, col.height+1, z); }
+        // Scatter tall grass on grass-surface blocks (not water, not tree spots)
+        if col.surface_block == BlockType::Grass && !col.is_water && !col.can_have_tree {
+            let grass_chance = noise.hash2d(wx + 7777, wz + 3333);
+            if grass_chance < 0.35 {
+                let gy = col.height + 1;
+                if gy < CHUNK_Y {
+                    chunk.set(x, gy, z, BlockType::TallGrass);
+                }
+            }
+        }
     }}
     chunk
 }
@@ -1029,6 +1250,20 @@ impl World {
         let lx = ((wx % CHUNK_X as i32) + CHUNK_X as i32) as usize % CHUNK_X;
         let lz = ((wz % CHUNK_Z as i32) + CHUNK_Z as i32) as usize % CHUNK_Z;
         if let Some(c) = self.chunks.get_mut(&ChunkPos::new(cx,cz)) { c.set(lx, wy as usize, lz, block); }
+        // Cascade-break: removing a block destroys unsupported TallGrass above it
+        if block == BlockType::Air && wy + 1 < CHUNK_Y as i32 {
+            if self.get_block(wx, wy + 1, wz) == BlockType::TallGrass {
+                // Compute chunk coords for the block above (may be same chunk)
+                let ay = (wy + 1) as usize;
+                let acx = if wx < 0 { (wx+1)/CHUNK_X as i32-1 } else { wx/CHUNK_X as i32 };
+                let acz = if wz < 0 { (wz+1)/CHUNK_Z as i32-1 } else { wz/CHUNK_Z as i32 };
+                let alx = ((wx % CHUNK_X as i32) + CHUNK_X as i32) as usize % CHUNK_X;
+                let alz = ((wz % CHUNK_Z as i32) + CHUNK_Z as i32) as usize % CHUNK_Z;
+                if let Some(c) = self.chunks.get_mut(&ChunkPos::new(acx,acz)) {
+                    c.set(alx, ay, alz, BlockType::Air);
+                }
+            }
+        }
         self.repropagate_light_around(cx, cz);
         if lx == 0          { self.mark_dirty(ChunkPos::new(cx-1, cz)); }
         if lx == CHUNK_X-1  { self.mark_dirty(ChunkPos::new(cx+1, cz)); }
@@ -1075,7 +1310,7 @@ impl World {
         let mut dist = 0.0;
         while dist < max_dist {
             let block = self.get_block(x, y, z);
-            if block.is_solid() || block == BlockType::Torch {
+            if block.is_solid() || block == BlockType::Torch || block == BlockType::TallGrass {
                 return Some(RayHit { block_pos: [x,y,z], place_pos: [px,py,pz], block_type: block });
             }
             px=x; py=y; pz=z;

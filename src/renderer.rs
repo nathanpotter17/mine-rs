@@ -1798,6 +1798,34 @@ fn generate_atlas_pixels() -> Vec<u8> {
         }
     }
 
+    // === TallGrass tile: row 3, col 0 (tile index 48) ===
+    // Single tile used for all cross-billboard faces. Spiky grass blades with alpha cutout.
+    {
+        let ox = 0 * TILE_SIZE; // col 0
+        let oy = 3 * TILE_SIZE; // row 3
+        for py in 0..TILE_SIZE { for px in 0..TILE_SIZE {
+            let n = hash_f(px as i32, py as i32, 2000);
+            let n2 = hash_f(px as i32, py as i32, 2050);
+            // Blade shape: narrow vertical strips with ragged tops
+            let blade_x = ((px as f32 + n * 3.0) * 0.8) as u32 % 4;
+            let blade_height = (8.0 + n2 * 7.0) as u32;
+            let from_bottom = TILE_SIZE - 1 - py;
+
+            if from_bottom < blade_height && (blade_x < 2 || n > 0.3) {
+                // Visible grass pixel
+                let height_factor = from_bottom as f32 / TILE_SIZE as f32;
+                let tip_fade = if from_bottom > blade_height.saturating_sub(2) { 0.7 } else { 1.0 };
+                let r = clamp_u8((40.0 + n * 50.0 + height_factor * 30.0) * tip_fade);
+                let g = clamp_u8((100.0 + n * 90.0 + height_factor * 40.0) * tip_fade);
+                let b = clamp_u8((15.0 + n * 25.0) * tip_fade);
+                set_pixel(&mut pixels, ox + px, oy + py, r, g, b, 255);
+            } else {
+                // Transparent pixel — alpha = 0 for cutout
+                set_pixel(&mut pixels, ox + px, oy + py, 0, 0, 0, 0);
+            }
+        }}
+    }
+
     pixels
 }
 

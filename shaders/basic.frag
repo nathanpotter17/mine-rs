@@ -1,6 +1,6 @@
 #version 450
 
-layout(binding = 1) uniform sampler2D texAtlas;  // binding 1 = texture atlas
+layout(binding = 1) uniform sampler2D texAtlas;
 
 layout(push_constant) uniform PushConstants {
     vec4 fog_color;
@@ -10,85 +10,103 @@ layout(push_constant) uniform PushConstants {
     float sun_intensity;
 } pc;
 
-layout(location = 0) in vec3 fragColor;     // tint color from vertex
+layout(location = 0) in vec3 fragColor;
 layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in float fragDist;
 layout(location = 3) in float fragAO;
-layout(location = 4) in float fragLight;
+layout(location = 4) in float fragSkyLight;
 layout(location = 5) in vec2 fragUV;
+layout(location = 6) in float fragBlockLight;
 
 layout(location = 0) out vec4 outColor;
 
-// Shared sun direction computation — MUST match sky.frag
+// Shared sun direction — MUST match sky.frag
 vec3 computeSunDir(float tod) {
     float angle = tod * 6.2831853;
     return normalize(vec3(cos(angle), sin(angle), 0.25));
 }
 
-// Reinhard tone mapping — prevents blown-out highlights
-vec3 tonemap(vec3 color) {
-    return color / (color + vec3(1.0));
+// Softened ACES-inspired filmic tone mapping
+vec3 tonemap(vec3 x) {
+    // Slightly gentler than stock ACES — less crushed blacks, softer rolloff
+    float a = 2.40;
+    float b = 0.04;
+    float c = 2.40;
+    float d = 0.62;
+    float e = 0.15;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
 void main() {
-    // Sample texture atlas
     vec4 texSample = texture(texAtlas, fragUV);
 
-    // Combine texture with per-vertex tint color
+    // Alpha test — foliage cutout (TallGrass, Leaves holes)
+    if (texSample.a < 0.5) discard;
+
     vec3 baseColor = texSample.rgb * fragColor;
 
-    // === Time-based directional sun light ===
+    // === Sun parameters ===
     vec3 sunDir = computeSunDir(pc.time_of_day);
     float sunElev = sunDir.y;
     float intensity = pc.sun_intensity;
 
-    // Sun color: warm at sunrise/sunset, neutral at noon
+    // Sun color: warm at horizon, white at zenith
     float sunsetBand = smoothstep(-0.05, 0.15, sunElev)
                      * (1.0 - smoothstep(0.15, 0.45, sunElev));
     vec3 sunTint = mix(vec3(1.0, 0.6, 0.35), vec3(1.0, 0.98, 0.95),
                        clamp(sunElev * 3.0, 0.0, 1.0));
-    sunTint = mix(sunTint, vec3(1.0, 0.5, 0.2), sunsetBand * 0.4);
+    sunTint = mix(sunTint, vec3(1.0, 0.5, 0.2), sunsetBand * 0.5);
 
-    // Ambient: stronger during day, dim blue at night
-    vec3 ambientColor = mix(vec3(0.04, 0.04, 0.08), vec3(0.40, 0.42, 0.50), intensity);
-    float ambientStr = mix(0.10, 0.32, intensity);
+    // === Hemispherical ambient (sky+ground bounce) ===
+    vec3 skyAmbient = mix(vec3(0.04, 0.04, 0.08), vec3(0.38, 0.44, 0.58), intensity);
+    vec3 groundBounce = mix(vec3(0.03, 0.02, 0.03), vec3(0.14, 0.11, 0.07), intensity);
+    float hemiBlend = fragNormal.y * 0.5 + 0.5;
+    vec3 ambientColor = mix(groundBounce, skyAmbient, hemiBlend);
 
-    // Diffuse: sun contribution scaled by intensity
+    // Sky light modulates ambient — caves/interiors get reduced sky ambient
+    // Softer gamma curve for gentler shadow transitions
+    float skyFactor = fragSkyLight * fragSkyLight;
+    vec3 ambient = ambientColor * mix(0.10, 0.40, intensity) * max(skyFactor, 0.08);
+
+    // === Directional sun diffuse ===
     float NdotL = max(dot(fragNormal, sunDir), 0.0);
-    float diffuseStr = NdotL * 0.55 * intensity;
+    // Softened shadow: wider ramp so transition from shade to sun is gradual
+    float shadowTerm = smoothstep(0.15, 1.0, fragSkyLight);
+    float diffuse = NdotL * 0.60 * intensity * shadowTerm;
 
-    // Sky fill: upward-facing surfaces catch scattered skylight
-    float skyFill = max(dot(fragNormal, vec3(0.0, 1.0, 0.0)), 0.0) * 0.10 * intensity;
+    // === Subsurface scattering (foliage translucency) ===
+    float NdotL_back = max(dot(-fragNormal, sunDir), 0.0);
+    float subsurface = NdotL_back * 0.15 * intensity * shadowTerm;
 
-    // Combine sun lighting
-    vec3 sunLight = ambientColor * ambientStr + sunTint * (diffuseStr + skyFill);
+    // === Sky fill: scattered overhead light ===
+    float skyFill = max(fragNormal.y, 0.0) * 0.12 * intensity * skyFactor;
 
-    // === Ambient Occlusion ===
-    float ao = mix(0.40, 1.0, fragAO);
+    vec3 sunLight = ambient + sunTint * (diffuse + skyFill + subsurface);
 
-    // === Torch / point light — warm glow ===
-    // FIX: Removed min() cap that killed torches. Reinhard tonemap handles
-    // any overflow gracefully — no more blown-out whites, but torches stay visible.
-    // Higher boost at night when sun_intensity is low.
-    vec3 torchColor = vec3(1.0, 0.82, 0.55);
-    float torchRaw = fragLight * fragLight;
-    float torchBoost = mix(1.8, 1.2, intensity);  // 1.8x at night, 1.2x at noon
-    float torchStrength = torchRaw * torchBoost;   // NO cap
+    // === Ambient Occlusion — gentle contact darkening ===
+    float ao = mix(0.42, 1.0, fragAO);
+    float aoAmb = mix(0.35, 1.0, fragAO);
+    // Blend: AO hits ambient harder, but overall softer than before
+    float aoBlend = diffuse / max(diffuse + 0.20, 0.001);
+    sunLight *= mix(aoAmb, ao, aoBlend);
 
-    // === Combine lighting ===
-    vec3 litColor = baseColor * sunLight * ao;
-    litColor += baseColor * torchColor * torchStrength;
+    // === Block light (torches, emissives) — warm glow ===
+    vec3 torchColor = vec3(1.0, 0.80, 0.50);
+    float torchRaw = fragBlockLight * fragBlockLight;
+    float torchBoost = mix(2.0, 0.9, intensity);  // brighter at night
+    vec3 blockLighting = torchColor * torchRaw * torchBoost;
 
-    // Slight minimum so nothing goes full black
-    float minLight = mix(0.03, 0.05, intensity);
-    litColor = max(litColor, baseColor * minLight);
+    // === Combine ===
+    vec3 litColor = baseColor * sunLight + baseColor * blockLighting;
 
-    // === Tone map block color (compresses highlights, fixes blown whites) ===
+    // Night floor: never fully black — slightly lifted
+    vec3 nightFloor = mix(vec3(0.02, 0.02, 0.04), vec3(0.035, 0.035, 0.035), intensity);
+    litColor = max(litColor, baseColor * nightFloor);
+
+    // === Tone map (softened ACES filmic) ===
     litColor = tonemap(litColor);
 
-    // === Fog AFTER tonemap ===
-    // fog_color is raw (not tonemapped) — matches the sky shader output space.
-    // At full fog, block color = fog_color = sky horizon → seamless blend to sky.
+    // === Fog ===
     float fogFactor = clamp((pc.fog_end - fragDist) / (pc.fog_end - pc.fog_start), 0.0, 1.0);
     vec3 color = mix(pc.fog_color.rgb, litColor, fogFactor);
 
