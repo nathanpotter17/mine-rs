@@ -1321,18 +1321,3 @@ impl MemoryContext {
         }
     }
 }
-
-// ===== Implementation Notes =====
-// 
-// This implementation follows Beta II Architecture principles:
-// 
-// 1. **Tagged Heap as Shared Backend**: All allocations go through TaggedHeap
-// 2. **Thread-Local Blocks**: Each thread has its own block via THREAD_ALLOCATOR
-// 3. **Frame Parameters**: Uncontended FrameParams with triple buffering
-// 4. **Job System**: Priority-based with stage guarding
-// 5. **Power-of-2 Alignment**: All allocations use align_to_power_of_2()
-// 6. **No Free(ptr)**: Only free_all_with_tag() for temporal cleanup
-// 7. **3 Frame Limit**: Enforced in FrameQueue::begin_frame()
-// 8. **Reference-based**: Minimal Arc usage, prefer borrows
-//
-// Reference: Rust ownership model - https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html

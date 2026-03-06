@@ -344,8 +344,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     setup_pause_menu(&mut renderer.ui_manager, &renderer.ui_overlay, &ui_actions, hud_text_id);
     println!("✓ UI system ready (press U to toggle)");
-    // Persistent HUD — always visible, auto-fitted to image aspect ratio
-    renderer.ui_manager.add_textured_element_fitted(
+    // Persistent HUD — always visible
+    renderer.ui_manager.add_hud_textured_element_fitted(
         &renderer.ui_overlay,
         0.01, 0.01,            // top-left corner
         0.15, 0.08,            // max bounding box
