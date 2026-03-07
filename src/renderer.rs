@@ -182,8 +182,11 @@ pub struct Renderer {
 const MAX_FRAMES: usize = 2;
 
 // Atlas constants
-const ATLAS_SIZE: u32 = 256;    // 256×256 pixels
-const TILE_SIZE: u32 = 16;      // 16×16 per tile
+const TILE_SIZE: u32 = 16;        // 16×16 per tile
+const TILE_LAYER_COUNT: u32 = 49; // 16 blocks × 3 faces (top/side/bottom) + 1 TallGrass
+
+// Intermediate buffer size for procedural generation (256×256 flat image, sliced into layers)
+const ATLAS_SIZE: u32 = 256;
 const TILES_PER_ROW: u32 = ATLAS_SIZE / TILE_SIZE; // = 16
 
 impl Renderer {
@@ -193,7 +196,7 @@ impl Renderer {
         // Create texture atlas
         let (atlas_image, atlas_memory, atlas_view, atlas_sampler) =
             Self::create_texture_atlas(&device, device_ctx)?;
-        println!("  ✓ Texture atlas generated ({}×{}, {} tiles)", ATLAS_SIZE, ATLAS_SIZE, TILES_PER_ROW * TILES_PER_ROW);
+        println!("  ✓ Texture array created ({}×{}, {} layers)", TILE_SIZE, TILE_SIZE, TILE_LAYER_COUNT);
 
         let descriptor_set_layout = Self::create_descriptor_set_layout(&device)?;
         let render_pass = Self::create_render_pass(&device, device_ctx.surface_format.format)?;
@@ -447,8 +450,8 @@ impl Renderer {
     fn create_texture_atlas(
         device: &Device, device_ctx: &DeviceContext,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler), Box<dyn std::error::Error>> {
-        // Try loading hand-painted atlas from file; fall back to procedural generation
-        let (pixels, width, height) = match image::open("assets/textures/block_atlas.png") {
+        // Generate or load the 256×256 intermediate atlas, then slice into per-tile layers.
+        let flat_pixels = match image::open("assets/textures/block_atlas.png") {
             Ok(img) => {
                 let (w, h) = img.dimensions();
                 if w != ATLAS_SIZE || h != ATLAS_SIZE {
@@ -456,28 +459,30 @@ impl Renderer {
                         "  [WARNING] block_atlas.png is {}x{}, expected {}x{} — falling back to procedural",
                         w, h, ATLAS_SIZE, ATLAS_SIZE
                     );
-                    (generate_atlas_pixels(), ATLAS_SIZE, ATLAS_SIZE)
+                    generate_atlas_pixels()
                 } else {
                     println!("  [SUCCESS] Loaded block_atlas.png ({}x{})", w, h);
-                    let rgba = img.to_rgba8();
-                    (rgba.into_raw(), w, h)
+                    img.to_rgba8().into_raw()
                 }
             }
             Err(_) => {
                 println!("No assets/textures/block_atlas.png found, using procedural atlas");
-                (generate_atlas_pixels(), ATLAS_SIZE, ATLAS_SIZE)
+                generate_atlas_pixels()
             }
         };
 
-        let image_size = (width * height * 4) as u64;
+        // Slice 256×256 flat atlas into contiguous per-layer pixel data (TILE_LAYER_COUNT × 16×16×4)
+        let layer_pixels = slice_atlas_to_layers(&flat_pixels, ATLAS_SIZE);
+        let image_size = layer_pixels.len() as u64;
 
         unsafe {
-            // Create DEVICE_LOCAL image
+            // Create DEVICE_LOCAL 2D array image — one 16×16 layer per tile
             let image = device.create_image(&vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::R8G8B8A8_SRGB)
-                .extent(vk::Extent3D { width, height, depth: 1 })
-                .mip_levels(1).array_layers(1)
+                .extent(vk::Extent3D { width: TILE_SIZE, height: TILE_SIZE, depth: 1 })
+                .mip_levels(1)
+                .array_layers(TILE_LAYER_COUNT)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
@@ -498,7 +503,7 @@ impl Renderer {
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
             let mapped = device.map_memory(staging_mem, 0, image_size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped as *mut u8, image_size as usize);
+            std::ptr::copy_nonoverlapping(layer_pixels.as_ptr(), mapped as *mut u8, image_size as usize);
             device.unmap_memory(staging_mem);
 
             // Upload via one-shot command buffer
@@ -512,7 +517,7 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
 
-            // Transition UNDEFINED → TRANSFER_DST_OPTIMAL
+            // Transition UNDEFINED → TRANSFER_DST_OPTIMAL (all layers)
             device.cmd_pipeline_barrier(cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
@@ -526,20 +531,26 @@ impl Renderer {
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0, level_count: 1,
-                        base_array_layer: 0, layer_count: 1,
+                        base_array_layer: 0, layer_count: TILE_LAYER_COUNT,
                     })]);
 
-            // Copy buffer → image
+            // Copy staging buffer → all layers in one command
+            // Buffer layout: TILE_LAYER_COUNT contiguous 16×16×4 regions, tightly packed
             device.cmd_copy_buffer_to_image(cmd, staging_buf, image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)   // tightly packed
+                    .buffer_image_height(0) // tightly packed
                     .image_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0, base_array_layer: 0, layer_count: 1,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: TILE_LAYER_COUNT,
                     })
-                    .image_extent(vk::Extent3D { width, height, depth: 1 })]);
+                    .image_extent(vk::Extent3D { width: TILE_SIZE, height: TILE_SIZE, depth: 1 })]);
 
-            // Transition TRANSFER_DST → SHADER_READ_ONLY
+            // Transition TRANSFER_DST → SHADER_READ_ONLY (all layers)
             device.cmd_pipeline_barrier(cmd,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
@@ -553,7 +564,7 @@ impl Renderer {
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0, level_count: 1,
-                        base_array_layer: 0, layer_count: 1,
+                        base_array_layer: 0, layer_count: TILE_LAYER_COUNT,
                     })]);
 
             device.end_command_buffer(cmd)?;
@@ -570,18 +581,18 @@ impl Renderer {
             device.destroy_buffer(staging_buf, None);
             device.free_memory(staging_mem, None);
 
-            // Image view
+            // Image view — TYPE_2D_ARRAY covering all layers
             let view = device.create_image_view(&vk::ImageViewCreateInfo::default()
                 .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
+                .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
                 .format(vk::Format::R8G8B8A8_SRGB)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0, level_count: 1,
-                    base_array_layer: 0, layer_count: 1,
+                    base_array_layer: 0, layer_count: TILE_LAYER_COUNT,
                 }), None)?;
 
-            // Sampler — NEAREST for that crisp pixel-art voxel look
+            // Sampler — NEAREST for crisp pixel-art, CLAMP_TO_EDGE per-layer prevents bleed
             let sampler = device.create_sampler(&vk::SamplerCreateInfo::default()
                 .mag_filter(vk::Filter::NEAREST)
                 .min_filter(vk::Filter::NEAREST)
@@ -1465,11 +1476,43 @@ impl Drop for Renderer {
 
 // ===== Procedural Texture Atlas Generation =====
 //
-// Layout: 16×16 grid of 16×16px tiles in a 256×256 RGBA8 image.
+// Procedural path generates a 256×256 intermediate RGBA8 image with a 16×16 grid
+// of 16×16px tiles. The `slice_atlas_to_layers()` function then rearranges this
+// into TILE_LAYER_COUNT contiguous 16×16 layers for the sampler2DArray upload.
+//
+// Tile index layout (matches BlockType::tile_index()):
 //   Row 0 (tiles 0-15):  top faces   — indexed by BlockType as u8
 //   Row 1 (tiles 16-31): side faces
 //   Row 2 (tiles 32-47): bottom faces
-//   Rows 3-15: reserved (filled with magenta for debugging)
+//   Row 3, col 0 (tile 48): TallGrass cross-billboard
+//   Remaining row 3+ cols: unused (magenta debug fill in intermediate buffer)
+
+/// Slice a 256×256 flat atlas into contiguous per-layer 16×16 RGBA pixel data.
+/// Layer `i` is sourced from grid position `(col = i % 16, row = i / 16)` in the atlas.
+/// Output: `TILE_LAYER_COUNT * TILE_SIZE * TILE_SIZE * 4` bytes, layers packed sequentially.
+fn slice_atlas_to_layers(atlas: &[u8], atlas_width: u32) -> Vec<u8> {
+    let layer_bytes = (TILE_SIZE * TILE_SIZE * 4) as usize;
+    let mut layers = vec![0u8; layer_bytes * TILE_LAYER_COUNT as usize];
+    let tiles_per_row = atlas_width / TILE_SIZE;
+
+    for layer in 0..TILE_LAYER_COUNT {
+        let col = layer % tiles_per_row;
+        let row = layer / tiles_per_row;
+        let dst_base = layer as usize * layer_bytes;
+
+        for py in 0..TILE_SIZE {
+            let src_y = row * TILE_SIZE + py;
+            let src_x = col * TILE_SIZE;
+            let src_offset = ((src_y * atlas_width + src_x) * 4) as usize;
+            let dst_offset = dst_base + (py * TILE_SIZE * 4) as usize;
+            let row_bytes = (TILE_SIZE * 4) as usize;
+            layers[dst_offset..dst_offset + row_bytes]
+                .copy_from_slice(&atlas[src_offset..src_offset + row_bytes]);
+        }
+    }
+
+    layers
+}
 
 /// Fast integer hash for procedural noise lattice points.
 #[inline]

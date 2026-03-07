@@ -1,6 +1,6 @@
 #version 450
 
-layout(binding = 1) uniform sampler2D texAtlas;
+layout(binding = 1) uniform sampler2DArray texAtlas;
 
 layout(push_constant) uniform PushConstants {
     vec4 fog_color;
@@ -17,6 +17,7 @@ layout(location = 3) in float fragAO;
 layout(location = 4) in float fragSkyLight;
 layout(location = 5) in vec2 fragUV;
 layout(location = 6) in float fragBlockLight;
+layout(location = 7) in flat float fragTileLayer;
 
 layout(location = 0) out vec4 outColor;
 
@@ -38,7 +39,7 @@ vec3 tonemap(vec3 x) {
 }
 
 void main() {
-    vec4 texSample = texture(texAtlas, fragUV);
+    vec4 texSample = texture(texAtlas, vec3(fragUV, fragTileLayer));
 
     // Alpha test — foliage cutout
     if (texSample.a < 0.5) discard;

@@ -27,6 +27,7 @@ layout(location = 3) out float fragAO;
 layout(location = 4) out float fragSkyLight;
 layout(location = 5) out vec2 fragUV;
 layout(location = 6) out float fragBlockLight;
+layout(location = 7) out flat float fragTileLayer;
 
 // Normal lookup — matches Face enum: Top, Bottom, North, South, East, West
 // Index 6 = cross-billboard sentinel (uses UP for ambient calc)
@@ -65,21 +66,11 @@ void main() {
     fragSkyLight   = float(lightPacked >> 4u) / 15.0;
     fragBlockLight = float(lightPacked & 0xFu) / 15.0;
 
-    // Decode tile atlas UV from packed .b (tile_index) and .a (uv_corner)
-    uint tileIndex = inNormalLight.b;
-    uint uvCorner  = clamp(inNormalLight.a, 0u, 3u);
-
-    float tileCol = float(tileIndex & 0xFu);       // % 16
-    float tileRow = float(tileIndex >> 4u);         // / 16
-    vec2 localUV  = UV_CORNERS[uvCorner];
-
-    // Half-texel inset prevents atlas tile bleeding
-    const float HALF_TEXEL = 1.0 / 256.0;
-    const float TILE_SIZE  = 1.0 / 16.0;
-
-    fragUV = vec2(tileCol, tileRow) * TILE_SIZE
-           + localUV * (TILE_SIZE - 2.0 * HALF_TEXEL)
-           + HALF_TEXEL;
+    // Texture array: tile_index is the array layer, uv_corner gives 0-1 per-tile UV.
+    // No atlas math, no inset — CLAMP_TO_EDGE per-layer prevents bleed.
+    uint uvCorner = clamp(inNormalLight.a, 0u, 3u);
+    fragUV        = UV_CORNERS[uvCorner];
+    fragTileLayer = float(inNormalLight.b);
 
     fragDist = distance(worldPos.xyz, ubo.camera_pos.xyz);
 }
