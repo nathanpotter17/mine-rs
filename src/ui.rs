@@ -79,6 +79,103 @@ fn build_quad_vertices(
     ]
 }
 
+// ===== UI Trim Sheet Layout =====
+//
+// Single 512×256 texture loaded once via UIOverlay::load_texture().
+// All UI elements sample sub-regions via uv_rect.
+/*
+    y=0:   title 384×48       | btn-resume  128×16
+    y=16:                      | btn-toggle  128×16
+    y=32:                      | btn-quit    128×16
+    y=48:  hud-badge 512×58
+    y=106: block-palette for UI 512×150  (32 cols × 9 rows)
+*/
+
+const PALETTE_Y_PX: f32 = 106.0;
+const PALETTE_COLS: u32 = 32;
+const PALETTE_ROWS: u32 = 9;
+const TILE_PX: f32 = 16.0;
+const SHEET_W: f32 = 512.0;
+const SHEET_H: f32 = 256.0;
+
+const HALF_U: f32 = 0.5 / SHEET_W;
+const HALF_V: f32 = 0.5 / SHEET_H;
+
+/// UV rect: title text (384×48 at origin)
+pub const UV_TITLE: [f32; 4] = [
+    HALF_U,
+    HALF_V,
+    0.75 - HALF_U,          // 384/512
+    0.1875 - HALF_V,        // 48/256
+];
+
+/// UV rect: Resume button label (128×16 at x=384, y=0)
+pub const UV_BTN_RESUME: [f32; 4] = [
+    0.75 + HALF_U,
+    HALF_V,
+    1.0 - HALF_U,
+    0.0625 - HALF_V,        // 16/256
+];
+
+/// UV rect: Toggle button label (128×16 at x=384, y=16)
+pub const UV_BTN_TOGGLE: [f32; 4] = [
+    0.75 + HALF_U,
+    0.0625 + HALF_V,        // 16/256
+    1.0 - HALF_U,
+    0.125 - HALF_V,         // 32/256
+];
+
+/// UV rect: Quit button label (128×16 at x=384, y=32)
+pub const UV_BTN_QUIT: [f32; 4] = [
+    0.75 + HALF_U,
+    0.125 + HALF_V,         // 32/256
+    1.0 - HALF_U,
+    0.1875 - HALF_V,        // 48/256
+];
+
+/// UV rect: full HUD badge row (512×58 at y=48)
+pub const UV_HUD_BADGE: [f32; 4] = [
+    HALF_U,
+    0.1875 + HALF_V,        // 48/256 — was 0.1484375 (38/256), 10px wrong
+    1.0 - HALF_U,
+    0.4140625 - HALF_V,     // 106/256
+];
+
+/// UV rect for a 16×16 tile in the block palette region.
+/// 32 columns × 10 rows = 320 slots starting at pixel (0, 96).
+///
+/// Layout convention (matching world atlas in renderer.rs):
+///   row 0: top faces   (block 0–16 in cols 0–16)
+///   row 1: side faces
+///   row 2: bottom faces
+///   row 3: cross sprites (TallGrass, etc.)
+///   rows 4–9: future (items, icons, particles)
+#[inline]
+pub fn block_tile_uv(col: u32, row: u32) -> [f32; 4] {
+    debug_assert!(col < PALETTE_COLS, "block_tile_uv: col {} >= {}", col, PALETTE_COLS);
+    debug_assert!(row < PALETTE_ROWS, "block_tile_uv: row {} >= {}", row, PALETTE_ROWS);
+
+    let x0 = (col as f32 * TILE_PX) / SHEET_W;
+    let y0 = (PALETTE_Y_PX + row as f32 * TILE_PX) / SHEET_H;
+    let x1 = x0 + TILE_PX / SHEET_W;   // +0.03125
+    let y1 = y0 + TILE_PX / SHEET_H;   // +0.0625
+
+    [x0, y0, x1, y1]
+}
+
+/// UV rect for a sub-region of the HUD badge row.
+/// `x_px`: left edge in pixels (0–512), `w_px`: width in pixels.
+/// Height is always the full badge (58px).
+#[inline]
+pub fn hud_badge_sub_uv(x_px: f32, w_px: f32) -> [f32; 4] {
+    [
+        x_px / SHEET_W,
+        UV_HUD_BADGE[1],
+        (x_px + w_px) / SHEET_W,
+        UV_HUD_BADGE[3],
+    ]
+}
+
 // ===== UI Element =====
 
 /// A single rectangle in screen space, optionally textured.
@@ -194,6 +291,73 @@ impl Button {
         let mut btn = Self {
             id,
             element: UIElement::new(x, y, w, h, normal),
+            state: ButtonState::Normal,
+            color_normal: normal,
+            color_hover: hover,
+            color_pressed: pressed,
+            color_disabled: disabled,
+        };
+        btn.apply_state_color();
+        btn
+    }
+
+    /// Create a textured button with automatic hover/press tint derivation.
+    /// `color` is the normal-state tint; hover brightens, press darkens.
+    /// Fragment shader computes: texture(tex, uv) * vertexColor.
+    /// For white-on-transparent button art, the tint IS the visible color.
+    pub fn new_textured(
+        id: u32,
+        x: f32, y: f32, w: f32, h: f32,
+        color: [f32; 4],
+        texture_id: u32,
+        uv_rect: [f32; 4],
+    ) -> Self {
+        let hover = [
+            (color[0] * 1.25).min(1.0),
+            (color[1] * 1.25).min(1.0),
+            (color[2] * 1.25).min(1.0),
+            color[3],
+        ];
+        let pressed = [
+            color[0] * 0.75,
+            color[1] * 0.75,
+            color[2] * 0.75,
+            color[3],
+        ];
+        let disabled = [
+            color[0] * 0.5,
+            color[1] * 0.5,
+            color[2] * 0.5,
+            color[3] * 0.6,
+        ];
+
+        let mut btn = Self {
+            id,
+            element: UIElement::new_textured(x, y, w, h, color, texture_id, uv_rect),
+            state: ButtonState::Normal,
+            color_normal: color,
+            color_hover: hover,
+            color_pressed: pressed,
+            color_disabled: disabled,
+        };
+        btn.apply_state_color();
+        btn
+    }
+
+    /// Textured button with explicit per-state tint colors.
+    pub fn new_textured_explicit(
+        id: u32,
+        x: f32, y: f32, w: f32, h: f32,
+        normal: [f32; 4],
+        hover: [f32; 4],
+        pressed: [f32; 4],
+        disabled: [f32; 4],
+        texture_id: u32,
+        uv_rect: [f32; 4],
+    ) -> Self {
+        let mut btn = Self {
+            id,
+            element: UIElement::new_textured(x, y, w, h, normal, texture_id, uv_rect),
             state: ButtonState::Normal,
             color_normal: normal,
             color_hover: hover,

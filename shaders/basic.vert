@@ -74,7 +74,7 @@ void main() {
     vec2 localUV  = UV_CORNERS[uvCorner];
 
     // Half-texel inset prevents atlas tile bleeding
-    const float HALF_TEXEL = 0.5 / 256.0;
+    const float HALF_TEXEL = 1.0 / 256.0;
     const float TILE_SIZE  = 1.0 / 16.0;
 
     fragUV = vec2(tileCol, tileRow) * TILE_SIZE

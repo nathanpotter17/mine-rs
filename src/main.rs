@@ -9,7 +9,11 @@ use simmerlib::{
     world::{World, BlockType, CHUNK_X, CHUNK_Z, RENDER_DISTANCE, GENERATION_DISTANCE, mesh_chunk, ChunkPos},
     player::{Player, PlayerInput, CameraMode},
     renderer::{Renderer, ViewUBO, Frustum},
-    ui::{UIManager, UIOverlay, UIElement, Button},
+    ui::{
+        UIManager, UIOverlay, UIElement, Button,
+        UV_TITLE, UV_BTN_RESUME, UV_BTN_TOGGLE, UV_BTN_QUIT,
+        UV_HUD_BADGE, block_tile_uv, hud_badge_sub_uv,
+    },
     net::{NetworkHandle, NetEvent, NetCommand, RemotePlayer, PlayerId},
 };
 use std::collections::HashMap as StdHashMap;
@@ -46,21 +50,16 @@ fn new_action_queue() -> ActionQueue {
 
 /// Populate the UIManager with a pause-menu layout.
 /// Called once at init; visibility toggled at runtime with U key.
-///
-/// Layout (normalized screen coords, 0-1):
-///   - Full-screen dim overlay
-///   - Dark centered panel
-///   - Three stacked buttons: Resume (green), Toggle Fly (blue), Quit (red)
 fn setup_pause_menu(
     manager: &mut UIManager,
     overlay: &UIOverlay,
     actions: &ActionQueue,
-    hud_text_id: u32,
+    sheet_id: u32,
 ) {
     manager.clear_elements();
     manager.clear_buttons();
 
-    // Full-screen dim overlay
+    // Full-screen dim overlay (solid color — no texture)
     manager.add_element(UIElement::new(
         0.0, 0.0, 1.0, 1.0,
         [0.0, 0.0, 0.0, 0.45],
@@ -78,35 +77,41 @@ fn setup_pause_menu(
         [0.4, 0.6, 1.0, 0.9],
     ));
 
-    // Title text image — auto-fitted to image aspect ratio, centered
+    // Title text — 384×38 region, aspect-fitted and centered
     manager.add_textured_element_centered(
         overlay,
-        0.50, 0.29,              // center_x, top y
+        0.50, 0.29,              // center_x, top_y
         0.28, 0.05,              // max bounding box
-        hud_text_id,
-        [0.0, 0.0, 1.0, 1.0],   // full image
-        [1.0, 1.0, 1.0, 1.0],   // no tint
+        sheet_id,
+        UV_TITLE,
+        [1.0, 1.0, 1.0, 1.0],   // no tint — show texture true-color
     );
 
-    // Resume — green
-    manager.add_button(Button::new(
+    // Resume
+    manager.add_button(Button::new_textured(
         BTN_RESUME,
-        0.40, 0.34, 0.20, 0.055,
-        [0.18, 0.55, 0.22, 0.92],
+        0.40, 0.36, 0.20, 0.045,
+        [0.9, 0.9, 0.9, 1.0], // no tint '90% bright' on already colored UI.
+        sheet_id,
+        UV_BTN_RESUME,
     ));
 
-    // Toggle Flying — blue
-    manager.add_button(Button::new(
+    // Toggle Flying
+    manager.add_button(Button::new_textured(
         BTN_TOGGLE_FLY,
-        0.40, 0.42, 0.20, 0.055,
-        [0.20, 0.35, 0.65, 0.92],
+        0.40, 0.42, 0.20, 0.045,
+        [0.9, 0.9, 0.9, 1.0], // no tint '90% bright' on already colored UI.
+        sheet_id,
+        UV_BTN_TOGGLE,
     ));
 
-    // Quit — red
-    manager.add_button(Button::new(
+    // Quit
+    manager.add_button(Button::new_textured(
         BTN_QUIT,
-        0.40, 0.50, 0.20, 0.055,
-        [0.65, 0.18, 0.18, 0.92],
+        0.40, 0.48, 0.20, 0.045,
+        [0.9, 0.9, 0.9, 1.0], // no tint '90% bright' on already colored UI.
+        sheet_id,
+        UV_BTN_QUIT,
     ));
 
     // Wire up callbacks → action queue
@@ -338,20 +343,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // UI
     let ui_actions = new_action_queue();
-    let hud_text_id = renderer.ui_overlay.load_texture(
+    let ui_sheet_id = renderer.ui_overlay.load_texture(
         &device_ctx,
-        "assets/ui/cat.png",
+        "assets/ui/trim.png",
     )?;
-    setup_pause_menu(&mut renderer.ui_manager, &renderer.ui_overlay, &ui_actions, hud_text_id);
+    setup_pause_menu(
+        &mut renderer.ui_manager,
+        &renderer.ui_overlay,
+        &ui_actions,
+        ui_sheet_id,
+    );
     println!("✓ UI system ready (press U to toggle)");
-    // Persistent HUD — always visible
+
+    // Persistent HUD — sample left third of the badge row
     renderer.ui_manager.add_hud_textured_element_fitted(
         &renderer.ui_overlay,
         0.01, 0.01,            // top-left corner
         0.15, 0.08,            // max bounding box
-        hud_text_id,
-        [0.0, 0.0, 0.5, 0.25],  // top-left quarter of image
-        [1.0, 1.0, 1.0, 0.7],   // slightly transparent
+        ui_sheet_id,
+        hud_badge_sub_uv(0.0, 170.0),  // first 170px of badge row
+        [1.0, 1.0, 1.0, 0.7],          // slightly transparent
     );
 
     // Mouse capture

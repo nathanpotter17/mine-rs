@@ -5,6 +5,7 @@ use crate::device::DeviceContext;
 use crate::world::{BlockVertex, ChunkMesh, ChunkPos};
 use crate::ui::{UIManager, UIOverlay};
 use crate::player::PlayerVertex;
+use image::GenericImageView;
 
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -446,16 +447,36 @@ impl Renderer {
     fn create_texture_atlas(
         device: &Device, device_ctx: &DeviceContext,
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler), Box<dyn std::error::Error>> {
-        // Generate procedural pixel data
-        let pixels = generate_atlas_pixels();
-        let image_size = (ATLAS_SIZE * ATLAS_SIZE * 4) as u64;
+        // Try loading hand-painted atlas from file; fall back to procedural generation
+        let (pixels, width, height) = match image::open("assets/textures/block_atlas.png") {
+            Ok(img) => {
+                let (w, h) = img.dimensions();
+                if w != ATLAS_SIZE || h != ATLAS_SIZE {
+                    eprintln!(
+                        "  [WARNING] block_atlas.png is {}x{}, expected {}x{} — falling back to procedural",
+                        w, h, ATLAS_SIZE, ATLAS_SIZE
+                    );
+                    (generate_atlas_pixels(), ATLAS_SIZE, ATLAS_SIZE)
+                } else {
+                    println!("  [SUCCESS] Loaded block_atlas.png ({}x{})", w, h);
+                    let rgba = img.to_rgba8();
+                    (rgba.into_raw(), w, h)
+                }
+            }
+            Err(_) => {
+                println!("No assets/textures/block_atlas.png found, using procedural atlas");
+                (generate_atlas_pixels(), ATLAS_SIZE, ATLAS_SIZE)
+            }
+        };
+
+        let image_size = (width * height * 4) as u64;
 
         unsafe {
             // Create DEVICE_LOCAL image
             let image = device.create_image(&vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::R8G8B8A8_SRGB)
-                .extent(vk::Extent3D { width: ATLAS_SIZE, height: ATLAS_SIZE, depth: 1 })
+                .extent(vk::Extent3D { width, height, depth: 1 })
                 .mip_levels(1).array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
@@ -516,7 +537,7 @@ impl Renderer {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         mip_level: 0, base_array_layer: 0, layer_count: 1,
                     })
-                    .image_extent(vk::Extent3D { width: ATLAS_SIZE, height: ATLAS_SIZE, depth: 1 })]);
+                    .image_extent(vk::Extent3D { width, height, depth: 1 })]);
 
             // Transition TRANSFER_DST → SHADER_READ_ONLY
             device.cmd_pipeline_barrier(cmd,
