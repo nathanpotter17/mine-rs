@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::thread;
 
-pub const RENDER_DISTANCE: i32 = 12;
+pub const RENDER_DISTANCE: i32 = 6;
 pub const GENERATION_DISTANCE: i32 = RENDER_DISTANCE + 2;
 pub const SEA_LEVEL: usize = 32;
 const MAX_CHUNKS_PER_FRAME: usize = 4;

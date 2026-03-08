@@ -6,6 +6,7 @@ use crate::world::{BlockVertex, ChunkMesh, ChunkPos};
 use crate::ui::{UIManager, UIOverlay};
 use crate::player::PlayerVertex;
 use image::GenericImageView;
+use crate::world::{RENDER_DISTANCE, CHUNK_X};
 
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -27,6 +28,17 @@ pub struct PushConstants {
     pub fog_end: f32,
     pub time_of_day: f32,    // 0.0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
     pub sun_intensity: f32,  // 0.0=full night, 1.0=full day (smooth, derived from time)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlayerPushConstants {
+    pub model: [[f32; 4]; 4],  // 64 bytes
+    pub fog_color: [f32; 4],   // 16 bytes
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub time_of_day: f32,
+    pub sun_intensity: f32,    // total: 96 bytes
 }
 
 // UBO: just view-projection
@@ -384,12 +396,12 @@ impl Renderer {
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dyn_state = vk::PipelineDynamicStateCreateInfo::default()
                 .dynamic_states(&dyn_states);
-
-            // Push constant: mat4 model = 64 bytes (vertex stage only)
+            
+            // Push player struct
             let push_range = vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .offset(0)
-                .size(64); // sizeof(mat4)
+                .size(std::mem::size_of::<PlayerPushConstants>() as u32);
 
             // Shares descriptor set layout with block pipeline (binding 0 = ViewUBO)
             let layout = device.create_pipeline_layout(
@@ -783,9 +795,9 @@ impl Renderer {
             }
             fog[3] = 1.0;
 
-            // Fog distances: shorter at night for atmosphere
-            let fog_start = lerp(35.0, 60.0, sun_intensity);
-            let fog_end   = lerp(55.0, 90.0, sun_intensity);
+            let max_view_blocks = (RENDER_DISTANCE as f32) * (CHUNK_X as f32);
+            let fog_start = lerp(max_view_blocks * 0.30, max_view_blocks * 0.55, sun_intensity);
+            let fog_end   = lerp(max_view_blocks * 0.50, max_view_blocks * 0.92, sun_intensity);
 
             let clear_values = [
                 vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } },
@@ -867,8 +879,6 @@ impl Renderer {
             }
 
             // === Pass 2.5: Player models ===
-            // Local player: only in third-person (player_model_visible).
-            // Remote players: always rendered when present, independent of local camera.
             let has_any_player_model = (self.player_model_visible || !self.remote_player_matrices.is_empty())
                 && self.player_model_index_count > 0;
             if has_any_player_model {
@@ -881,30 +891,44 @@ impl Renderer {
                 self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.player_model_vertex_buffer], &[0]);
                 self.device.cmd_bind_index_buffer(cmd, self.player_model_index_buffer, 0, vk::IndexType::UINT32);
 
+                // Helper closure: build PlayerPushConstants from a model matrix + existing fog values
+                let make_player_push = |model: [[f32; 4]; 4]| -> PlayerPushConstants {
+                    PlayerPushConstants {
+                        model,
+                        fog_color: push.fog_color,
+                        fog_start: push.fog_start,
+                        fog_end: push.fog_end,
+                        time_of_day: push.time_of_day,
+                        sun_intensity: push.sun_intensity,
+                    }
+                };
+
                 // --- Local player (third-person only) ---
                 if self.player_model_visible {
-                    let model_bytes: &[u8] = std::slice::from_raw_parts(
-                        self.player_model_matrix.as_ptr() as *const u8,
-                        64,
+                    let pp = make_player_push(self.player_model_matrix);
+                    let pp_bytes: &[u8] = std::slice::from_raw_parts(
+                        &pp as *const PlayerPushConstants as *const u8,
+                        std::mem::size_of::<PlayerPushConstants>(),
                     );
                     self.device.cmd_push_constants(
                         cmd, self.player_model_pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX,
-                        0, model_bytes,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0, pp_bytes,
                     );
                     self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
                 }
 
                 // --- Remote players (always) ---
                 for matrix in &self.remote_player_matrices {
-                    let model_bytes: &[u8] = std::slice::from_raw_parts(
-                        matrix.as_ptr() as *const u8,
-                        64,
+                    let pp = make_player_push(*matrix);
+                    let pp_bytes: &[u8] = std::slice::from_raw_parts(
+                        &pp as *const PlayerPushConstants as *const u8,
+                        std::mem::size_of::<PlayerPushConstants>(),
                     );
                     self.device.cmd_push_constants(
                         cmd, self.player_model_pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX,
-                        0, model_bytes,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0, pp_bytes,
                     );
                     self.device.cmd_draw_indexed(cmd, self.player_model_index_count, 1, 0, 0, 0);
                 }
