@@ -2,6 +2,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::thread;
 
+pub const RENDER_DISTANCE: i32 = 12;
+pub const GENERATION_DISTANCE: i32 = RENDER_DISTANCE + 2;
+pub const SEA_LEVEL: usize = 32;
+const MAX_CHUNKS_PER_FRAME: usize = 4;
+const GEN_WORKERS: usize = 2;
+const MESH_WORKERS: usize = 2;
+const HM_PREFETCH: i32 = GENERATION_DISTANCE + 3;
+
+pub const CHUNK_X: usize = 16;
+pub const CHUNK_Y: usize = 128;
+pub const CHUNK_Z: usize = 16;
+
 // ===== Block Types =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,10 +115,6 @@ impl Face {
 }
 
 // ===== Chunk =====
-
-pub const CHUNK_X: usize = 16;
-pub const CHUNK_Y: usize = 128;
-pub const CHUNK_Z: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ChunkPos { pub x: i32, pub z: i32 }
@@ -433,10 +441,11 @@ static LIGHT_OFFSETS: [[[(i32,i32,i32);3];4];6] = [
     [[(0,0,1),(0,-1,0),(0,-1,1)],[(0,0,-1),(0,-1,0),(0,-1,-1)],[(0,0,-1),(0,1,0),(0,1,-1)],[(0,0,1),(0,1,0),(0,1,1)]],
 ];
 
-const INV_3: f32 = 1.0 / 3.0;
-const INV_LX15: f32 = 1.0 / (4.0 * 15.0);
 
 // ===== Generic AO/Light computation =====
+
+const INV_3: f32 = 1.0 / 3.0;
+const INV_LX15: f32 = 1.0 / (4.0 * 15.0);
 
 #[inline]
 fn compute_ao_generic(x: i32, y: i32, z: i32, face: Face, get: &impl Fn(i32,i32,i32)->BlockType) -> [u8;4] {
@@ -1077,14 +1086,6 @@ fn place_tree(chunk: &mut Chunk, x: usize, y: usize, z: usize) {
 }
 
 // ===== World =====
-
-pub const RENDER_DISTANCE: i32 = 6;
-pub const GENERATION_DISTANCE: i32 = RENDER_DISTANCE + 2;
-pub const SEA_LEVEL: usize = 32;
-const MAX_CHUNKS_PER_FRAME: usize = 4;
-const GEN_WORKERS: usize = 2;
-const MESH_WORKERS: usize = 2;
-const HM_PREFETCH: i32 = GENERATION_DISTANCE + 3;
 
 pub struct World {
     pub chunks: HashMap<ChunkPos, Chunk>,
